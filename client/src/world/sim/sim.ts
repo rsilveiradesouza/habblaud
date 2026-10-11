@@ -6,8 +6,8 @@ import type { ArtModule, Dir, RoomTheme } from '../../art/api';
 import type { WorldOptions } from '../api';
 import { COL_W, COMPACT_DELAY_MS, DISMANTLE_DELAY_MS, FOOT_DX, FOOT_DY, MISSING_DEBOUNCE_MS, RUN_SPEED, TILE, WALK_SPEED } from '../constants';
 import { assembleBuilding, type BuildingLayout } from '../layout/building';
-import { RECEPTION_ID } from '../layout/core';
-import { columnsFor, inRect } from '../layout/geometry';
+import { CAFE_ID, RECEPTION_ID } from '../layout/core';
+import { existingBlocks, inRect, occupiedRegions, regionAt, regionKey, retainRegions } from '../layout/geometry';
 import { layoutProjectRoom } from '../layout/room';
 import type { SpotDef, SpotKind } from '../layout/types';
 import { PathFinder } from '../path/astar';
@@ -79,6 +79,11 @@ function between(rng: () => number, a: number, b: number): number {
   return a + rng() * (b - a);
 }
 
+/** Depois do café, sentar à mesa só quando o café foi na copa do principal: o saguão do anexo não tem mesas (spec 7.3). */
+export function cafeSeatAfter(coffee: SpotDef): boolean {
+  return coffee.areaId === CAFE_ID;
+}
+
 /** O que define a aparência de um personagem (muda quando o personagem é editado). */
 const lookSig = (a: AgentInfo): string => `${a.seed}|${a.look}|${partsKey(a.parts)}`;
 
@@ -126,7 +131,7 @@ export class Sim {
     storage: StorageLike | null = browserStorage(),
   ) {
     this.social = new Social(this, storage);
-    this.building = assembleBuilding(columnsFor([]), [], 0);
+    this.building = assembleBuilding(existingBlocks([]), [], 0);
     this.finder = new PathFinder(this.building.grid);
     this.spots.setSpots(this.building.spots);
     for (const s of this.spots.ofKind('elevator')) this.elevators.push(new Elevator(this.elevators.length, s.id));
@@ -488,24 +493,22 @@ export class Sim {
 
   // =================================================================== layout
 
-  /** Recalcula o prédio (largura, grade, spots) a partir das salas presentes. */
+  /** Recalcula o prédio (blocos e colunas de pé, grade, spots) a partir das salas presentes. */
   relayout(force = false): void {
     const present = [...this.rooms.values()].filter((r) => r.present);
-    let cols = columnsFor(present.map((r) => r.slot));
-    const cur = this.building.cols;
-    if (cols < cur && !force) {
-      // só encolhe quando ninguém está na faixa que vai sumir
-      const limit = cols * COL_W * TILE;
-      if ([...this.chars.values()].some((c) => !c.gone && c.x >= limit - TILE)) {
-        cols = cur;
-        this.shrinkPending = true;
-      } else this.shrinkPending = false;
-    } else this.shrinkPending = false;
-    const building = assembleBuilding(
-      cols,
-      present.map((r) => r.layout),
-      this.layoutVersion + 1,
-    );
+    const slots = present.map((r) => r.slot);
+    let blocks = existingBlocks(slots);
+    this.shrinkPending = false;
+    if (!force) {
+      // trava de encolher, como união (spec 7.2): as colunas, os blocos (com os ancestrais) e as passarelas do layout
+      // anterior onde há alguém (não `gone`) continuam de pé e o prédio é montado com as salas presentes de agora (a
+      // sala que saiu vira pátio); enquanto houver retenção, shrinkPending faz o housekeeping tentar de novo a cada 1 s
+      const tiles = [...this.chars.values()].filter((c) => !c.gone).map((c) => ({ tx: c.tx, ty: c.ty }));
+      const kept = retainRegions(slots, occupiedRegions(this.building.blocks, this.building.bridges, tiles));
+      blocks = kept.blocks;
+      this.shrinkPending = kept.retained;
+    }
+    const building = assembleBuilding(blocks, present.map((r) => r.layout), this.layoutVersion + 1);
     this.building = building;
     this.layoutVersion++;
     this.finder.setGrid(building.grid);
@@ -533,13 +536,22 @@ export class Sim {
       }
       if (stale) this.interrupt(ch);
       if (!this.building.grid.walkable(ch.tx, ch.ty) && !ch.atSpot && !ch.inside) {
-        const n = this.building.grid.nearestWalkable(ch.tx, ch.ty);
+        // o tile mais próximo da MESMA região (bloco ou passarela): ninguém atravessa a rua num relayout; fora de toda
+        // região (não deveria acontecer), o mais próximo que houver
+        const here = this.regionOf(ch.tx, ch.ty);
+        const n = this.building.grid.nearestWalkable(ch.tx, ch.ty, COL_W + 2, here ? (x, y) => this.regionOf(x, y) === here : undefined);
         if (n) {
           ch.tx = n.x;
           ch.ty = n.y;
         }
       }
     }
+  }
+
+  /** Região (bloco de pé ou passarela) do tile no prédio atual, ou null (rua, jardim). */
+  private regionOf(tx: number, ty: number): string | null {
+    const r = regionAt(this.building.blocks, this.building.bridges, tx, ty);
+    return r ? regionKey(r) : null;
   }
 
   // =================================================================== atualização por frame
@@ -1254,7 +1266,7 @@ export class Sim {
   /** Tile livre para alguém ficar em pé (sem assento, sem spot e sem outra pessoa). */
   private overflowFree(x: number, y: number, ch: Character, busy = this.busyTiles(ch.id)): boolean {
     const grid = this.building.grid;
-    if (grid.get(x, y) !== FREE || busy.has(y * grid.w + x)) return false;
+    if (grid.get(x, y) !== FREE || busy.has(grid.key(x, y))) return false;
     for (const s of this.spots.all()) if (s.tx === x && s.ty === y) return false;
     return true;
   }
@@ -1280,7 +1292,7 @@ export class Sim {
           [-1, 0],
           [0, 1],
           [0, -1],
-        ] as const) if (busy.has((y + dy) * grid.w + x + dx)) crowd++;
+        ] as const) if (busy.has(grid.key(x + dx, y + dy))) crowd++;
         const backed = solidAt(0, -1) || solidAt(0, 1) ? 2 : solidAt(1, 0) || solidAt(-1, 0) ? 1 : 0;
         const squeezed = (solidAt(1, 0) && solidAt(-1, 0)) || (solidAt(0, 1) && solidAt(0, -1)) ? 3 : 0;
         const score = backed - squeezed - crowd * 3 - (Math.abs(x - ch.tx) + Math.abs(y - ch.ty)) * 0.05 + ch.rng() * 0.8;
@@ -1294,7 +1306,7 @@ export class Sim {
   }
 
   private lobbyTile(ch: Character): { x: number; y: number } {
-    const reception = this.building.core.find((a) => a.id === RECEPTION_ID)!;
+    const reception = this.building.areas.find((a) => a.id === RECEPTION_ID)!;
     const r = reception.rect;
     for (let k = 0; k < 20; k++) {
       const x = r.x + 2 + Math.floor(ch.rng() * 12);
@@ -1417,7 +1429,7 @@ export class Sim {
       const y = target.ty + dy;
       const cell = grid.get(x, y);
       if (cell === 0) continue;
-      const d = Math.abs(x - from.tx) + Math.abs(y - from.ty) + (cell === SEAT ? 20 : 0) + (busy.has(y * grid.w + x) ? 40 : 0) + (dx && dy ? 3 : 0);
+      const d = Math.abs(x - from.tx) + Math.abs(y - from.ty) + (cell === SEAT ? 20 : 0) + (busy.has(grid.key(x, y)) ? 40 : 0) + (dx && dy ? 3 : 0);
       if (d < bestD) {
         bestD = d;
         best = { x, y };
@@ -1426,18 +1438,33 @@ export class Sim {
     return best ?? grid.nearestWalkable(target.tx, target.ty) ?? { x: target.tx, y: target.ty };
   }
 
-  /** Tiles (índice y*w+x) onde há alguém parado ou indo parar, exceto `a` e `b`. */
+  /** Tiles (índice `grid.key`) onde há alguém parado ou indo parar, exceto `a` e `b`. */
   busyTiles(a: string, b?: string): Set<number> {
-    const w = this.building.grid.w;
+    const grid = this.building.grid;
     const out = new Set<number>();
     for (const c of this.chars.values()) {
       if (c.gone || c.id === a || c.id === b) continue;
-      out.add(c.ty * w + c.tx);
+      out.add(grid.key(c.tx, c.ty));
       const go = c.step?.t === 'go' ? c.step : c.queue.find((s): s is Extract<Step, { t: 'go' }> => s.t === 'go');
-      if (go) out.add(go.ty * w + go.tx);
-      if (c.standTile) out.add(c.standTile.y * w + c.standTile.x);
+      if (go) out.add(grid.key(go.tx, go.ty));
+      if (c.standTile) out.add(grid.key(c.standTile.x, c.standTile.y));
     }
     return out;
+  }
+
+  /**
+   * Spot livre de um serviço (café, água, cabine, pia) para `ch`: primeiro na mesma região (bloco) em que ele está
+   * (spec 7.3), senão em qualquer lugar. `near` manda na distância (padrão: o tile de `ch`); `rng` sorteia entre os 3
+   * mais próximos.
+   */
+  serviceSpot(kind: 'coffee' | 'water' | 'stall' | 'sink', ch: Character, opts: { near?: { tx: number; ty: number }; rng?: () => number } = {}): SpotDef | null {
+    const near = opts.near ?? { tx: ch.tx, ty: ch.ty };
+    const here = this.regionOf(ch.tx, ch.ty);
+    if (here) {
+      const same = this.spots.findFree(kind, { near, by: ch.id, rng: opts.rng, filter: (s) => this.regionOf(s.tx, s.ty) === here });
+      if (same) return same;
+    }
+    return this.spots.findFree(kind, { near, by: ch.id, rng: opts.rng });
   }
 
   private randomFree(kinds: SpotKind[], ch: Character): SpotDef | null {
@@ -1480,14 +1507,14 @@ export class Sim {
 
     switch (what) {
       case 'coffee': {
-        const s = this.spots.findFree('coffee', { near, by: ch.id, rng })!;
+        const s = this.serviceSpot('coffee', ch, { near, rng })!;
         if (!this.reserveTemp(ch, s)) return false;
         this.pushLeave(ch, steps);
         goUse(s);
         steps.push({ t: 'act', pose: 'use', ms: 1900, machine: s.furnitureId, icon: 'coffee' }, { t: 'act', pose: 'drink', held: 'coffee', ms: 2600 });
         release(s);
         carry = 'coffee';
-        if (rng() < 0.45) {
+        if (cafeSeatAfter(s) && rng() < 0.45) {
           const seat = this.spots.findFree('cafe_seat', { by: ch.id, rng, near: { tx: s.tx, ty: s.ty } });
           if (seat && this.reserveTemp(ch, seat)) {
             steps.push(
@@ -1502,7 +1529,7 @@ export class Sim {
         break;
       }
       case 'water': {
-        const s = this.spots.findFree('water', { near, by: ch.id, rng })!;
+        const s = this.serviceSpot('water', ch, { near, rng })!;
         if (!this.reserveTemp(ch, s)) return false;
         this.pushLeave(ch, steps);
         goUse(s);
@@ -1512,12 +1539,12 @@ export class Sim {
         break;
       }
       case 'bathroom': {
-        const s = this.spots.findFree('stall', { by: ch.id, rng })!;
+        const s = this.serviceSpot('stall', ch, { rng })!;
         if (!this.reserveTemp(ch, s)) return false;
         this.pushLeave(ch, steps);
         steps.push({ t: 'go', tx: s.tx, ty: s.ty }, { t: 'stall', spot: s.id, ms: between(rng, 5000, 12000), phase: 0 });
         release(s);
-        const sink = this.spots.findFree('sink', { near: { tx: s.tx, ty: s.ty }, by: ch.id });
+        const sink = this.serviceSpot('sink', ch, { near: { tx: s.tx, ty: s.ty } });
         if (sink && this.reserveTemp(ch, sink)) {
           goUse(sink);
           steps.push({ t: 'act', pose: 'use', ms: 2200 });
