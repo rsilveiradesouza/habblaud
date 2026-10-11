@@ -7,7 +7,7 @@ import type { SoundControl } from './sound';
 const CATEGORY_UI: Readonly<Record<SoundCategory, { label: string; hint: string; sample: SoundKind }>> = {
   alerts: { label: 'Avisos', hint: 'Sino quando alguém precisa de você; estalo quando uma tarefa termina.', sample: 'chime' },
   keys: { label: 'Teclado', hint: 'Digitação baixinha de quem trabalha nas salas à vista.', sample: 'keys' },
-  elevator: { label: 'Elevador', hint: '"Ding" quando alguém chega ou vai embora.', sample: 'elevator' },
+  elevator: { label: 'Porta de entrada', hint: '"Ding" quando alguém chega ou vai embora pela rua.', sample: 'elevator' },
   social: { label: 'Rodas', hint: 'Pingue-pongue e fliperama no lounge.', sample: 'pingpong' },
 };
 
@@ -57,7 +57,7 @@ export class SoundSettingsGroup {
       'div',
       { class: 'ui-snd__details' },
       h('div', { class: 'ui-set ui-snd__vol' }, h('span', { class: 'ui-set__label', text: 'Volume' }), this.volume, this.volumeOut),
-      h('div', { class: 'ui-set ui-set--stack' }, h('span', { class: 'ui-set__label', text: 'Tocar' }), chipRow, h('span', { class: 'ui-set__hint', text: 'Avisos: sino e estalo · Teclado: quem digita nas salas à vista · Elevador: chegadas e saídas · Rodas: pingue-pongue e fliperama.' })),
+      h('div', { class: 'ui-set ui-set--stack' }, h('span', { class: 'ui-set__label', text: 'Tocar' }), chipRow, h('span', { class: 'ui-set__hint', text: 'Avisos: sino e estalo · Teclado: quem digita nas salas à vista · Porta de entrada: chegadas e saídas · Rodas: pingue-pongue e fliperama.' })),
     );
 
     this.el = h(
