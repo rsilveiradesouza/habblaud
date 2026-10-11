@@ -163,6 +163,7 @@ export function blockFor(slot: number, k = IMPLEMENTED_BLOCKS): BlockId {
 
 /** Endereço (bloco, coluna, lado) da vaga global; transitório 7.5: colunas extras (6, 7, 8...) a leste do principal. */
 export function slotAddress(slot: number, k = IMPLEMENTED_BLOCKS): SlotAddress {
+  slot = Math.max(0, slot);
   const n = Math.floor(slot / ROOMS_PER_BLOCK);
   if (n < k) {
     const block = blockOrder(n);
@@ -275,13 +276,16 @@ export function occupiedColumns(blocks: readonly BlockLayout[], tiles: Iterable<
   const seen = new Set<string>();
   const refs: ColumnRef[] = [];
   for (const t of tiles) {
-    for (const b of blocks) {
-      const col = columnAt(b, t.tx, t.ty);
-      if (col === null) continue;
-      const key = `${blockKey(b.id)}:${col}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      refs.push({ block: b.id, col });
+    // margem de 1 tile em x: quem está na borda segura as duas colunas (como a trava antiga)
+    for (const tx of [t.tx - 1, t.tx, t.tx + 1]) {
+      for (const b of blocks) {
+        const col = columnAt(b, tx, t.ty);
+        if (col === null) continue;
+        const key = `${blockKey(b.id)}:${col}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({ block: b.id, col });
+      }
     }
   }
   return refs;
@@ -347,6 +351,9 @@ export function retainRegions(slots: Iterable<number>, refs: readonly RegionRef[
 export const BRIDGE_W = 3;
 /** x local (na coluna) da porta externa de 3 tiles: lx 7..10. */
 export const DOOR_LX = 7;
+/** Altura (tiles) da passagem na parede sul do lounge (1 tile de parede) e na face norte do saguão (2 tiles de parede). */
+export const LOUNGE_EXIT_H = 1;
+export const HUB_DOOR_H = 2;
 
 export interface BridgeLayout {
   /** `passarela:<bx>,<by>` do bloco filho. */
@@ -389,8 +396,8 @@ export function bridgeOpenings(child: BlockId): TileRect[] {
   const first = rects[0];
   const last = rects[rects.length - 1];
   return [
-    { x: first.x, y: first.y - 1, w: first.w, h: 1 },
-    { x: last.x, y: last.y + last.h, w: last.w, h: 2 },
+    { x: first.x, y: first.y - LOUNGE_EXIT_H, w: first.w, h: LOUNGE_EXIT_H },
+    { x: last.x, y: last.y + last.h, w: last.w, h: HUB_DOOR_H },
   ];
 }
 

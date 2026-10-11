@@ -54,12 +54,16 @@ export function layoutExterior(blocks: readonly BlockLayout[], bridges: readonly
   // a rua fica ao sul do PRINCIPAL (não do retângulo de pé): com anexos ao sul, o mundo cresce e a rua não desce
   const main = blockRect(PRINCIPAL);
   const south = main.y + main.h;
-  /** Um prop só entra se o tile da sua base não cai num bloco de pé nem num trecho de passarela (spec 4). */
+  /** Meia-largura (px) dos sprites com copa: a base pode ficar fora do bloco e a copa invadir a parede lateral. */
+  const HALF_W: Partial<Record<ExteriorProp['kind'], number>> = { tree: 18, pine: 14 };
+  /** Um prop só entra se o tile da sua base não cai num bloco de pé nem num trecho de passarela (spec 4), e a copa não encosta num bloco. */
   const place = (p: ExteriorProp) => {
     const tx = Math.floor(p.x / TILE);
     const ty = Math.floor(p.y / TILE);
     if (blocks.some((b) => inRect(b.rect, tx, ty))) return;
     if (bridges.some((br) => br.rects.some((r) => inRect(r, tx, ty)))) return;
+    const h = HALF_W[p.kind] ?? 0;
+    if (h && blocks.some((b) => ty >= b.rect.y && ty < b.rect.y + b.rect.h && p.x + h > b.rect.x * TILE && p.x - h < (b.rect.x + b.rect.w) * TILE)) return;
     props.push(p);
   };
   /** Árvore ou arbusto ao norte: descartado se cair na zona da entrada (o rng já foi consumido). */
@@ -125,8 +129,8 @@ export function layoutExterior(blocks: readonly BlockLayout[], bridges: readonly
     }
   }
   // banco e totem com a marca ao lado do caminho de pedra, na entrada norte
-  place({ kind: 'bench', x: px(45), y: px(-1) + 6, seed: 1 });
-  place({ kind: 'totem', x: px(37) + 8, y: px(-1), seed: 2 });
+  place({ kind: 'bench', x: px(ENTRANCE_X + ENTRANCE_W + 2.5), y: px(-1) + 6, seed: 1 });
+  place({ kind: 'totem', x: px(ENTRANCE_X - 2.5) + 8, y: px(-1), seed: 2 });
 
   const streetY = px(south + 4);
   const streetH = px(5);

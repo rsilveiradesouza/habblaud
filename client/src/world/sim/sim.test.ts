@@ -463,7 +463,7 @@ describe('salas sem buracos', () => {
     expect(sim.building.blocks[0].columns).toEqual({ lo: 1, hi: 4 });
   });
 
-  it('terminal fechou: a sala mais distante se muda para a vaga, o pessoal vai andando e a vaga antiga vira pátio', () => {
+  it('terminal fechou: a sala da maior vaga se muda para a vaga livre, o pessoal vai andando e a vaga antiga vira pátio', () => {
     const sim = newSim();
     const clock = { now: T0 };
     const rooms = [room('/a', 0), room('/b', 1), room('/c', 2)];
@@ -655,7 +655,7 @@ describe('salas sem buracos', () => {
     sim.applySnapshot(snap(rooms.filter((r) => r.id !== '/e'), agents.map((a) => (a.roomId === '/e' ? { ...a, status: 'offline' as const } : a)), 2), clock.now);
     run(sim, clock, 200, () => !sim.rooms.has('/e'));
     expect(sim.rooms.has('/e')).toBe(false);
-    // a sala mais distante (/q) se muda para a vaga 4 (reconstruída, apagada); o endereço antigo vira fantasma
+    // a sala da maior vaga (/q) se muda para a vaga 4 (reconstruída, apagada); o endereço antigo vira fantasma
     run(sim, clock, 3, () => q.slot === 4);
     expect(q.slot).toBe(4);
     expect(q.layout.rect).toEqual({ x: 80, y: 0, w: 16, h: 12 }); // coluna 5 norte
@@ -741,6 +741,10 @@ describe('salas sem buracos', () => {
       [0, 1, 2, 3],
     ]);
     expect(sim.building.bridges).toHaveLength(1);
+    // iza foi para um tile caminhável do próprio bloco (fallback por região), e o mundo segue com o anexo
+    expect(sim.building.grid.walkable(iza.tx, iza.ty)).toBe(true);
+    expect(iza.ty).toBeGreaterThanOrEqual(41);
+    expect(sim.building.rect).toEqual({ x: 0, y: 0, w: 96, h: 70 });
     // iza vai embora: o housekeeping (shrinkPending) derruba o anexo e a passarela sozinho
     sim.spots.releaseAll('iza');
     sim.chars.delete('iza');
@@ -779,7 +783,7 @@ describe('salas sem buracos', () => {
     expect(sim.building.bridges).toEqual([]);
   });
 
-  it('Review Focus 3 — relayout(true) com alguém na rua (fora de toda região) não o leva para o outro lado: fica onde está', () => {
+  it('relayout(true) com alguém na rua (fora de toda região, sem filtro): vai para o tile caminhável mais próximo em raio COL_W + 2, a porta sul do lounge', () => {
     const sim = newSim();
     const clock = { now: T0 };
     sim.applySnapshot(snap(...nineRooms()), clock.now);
@@ -798,6 +802,7 @@ describe('salas sem buracos', () => {
     // sem região própria, o fallback é o de sempre (tile caminhável mais próximo, raio COL_W + 2): a porta sul do lounge, logo acima
     expect(sim.building.grid.walkable(iza.tx, iza.ty)).toBe(true);
     expect(iza.ty).toBeLessThanOrEqual(28);
+    expect([iza.tx, iza.ty]).toEqual([56, 28]);
   });
 
   it('serviceSpot: café, água, cabine e pia do mesmo bloco primeiro (quem está no anexo usa o saguão e o WC do anexo; quem está no principal, a copa e os banheiros)', () => {
@@ -830,7 +835,27 @@ describe('salas sem buracos', () => {
     const iza = sim.chars.get('iza')!;
     // ocupa todas as cabines do anexo (WC: 3; saguão: 1) com outra pessoa
     for (const s of sim.spots.ofKind('stall')) if (s.areaId.startsWith('anexo:0,1:')) sim.spots.reserve(s.id, 'ana');
-    expect(sim.serviceSpot('stall', iza)!.areaId).toBe('core:banheiros');
+    const stall = sim.serviceSpot('stall', iza)!;
+    expect(stall.areaId).toBe('core:banheiros');
+    // a pia acompanha a cabine escolhida, não a mesa de iza (spec 7.3: mesmo bloco do serviço)
+    const sink = sim.serviceSpot('sink', iza, { near: { tx: stall.tx, ty: stall.ty }, at: { tx: stall.tx, ty: stall.ty } })!;
+    expect(sink.areaId).toBe('core:banheiros');
+  });
+
+  it('café no saguão não leva a sentar na copa; café na copa pode (guarda cafeSeatAfter em planOuting)', () => {
+    const sim = newSim();
+    const clock = { now: T0 };
+    sim.applySnapshot(snap(...nineRooms()), clock.now);
+    run(sim, clock, 0.5);
+    const plan = (id: string) => {
+      const ch = sim.chars.get(id)!;
+      Object.assign(ch, { rng: () => 0.1 }); // < 0.45: sentaria se a guarda deixasse
+      sim.clearPlan(ch);
+      expect((sim as unknown as { planOuting(c: typeof ch, now: number, what?: 'coffee'): boolean }).planOuting(ch, clock.now, 'coffee')).toBe(true);
+      return ch.queue.filter((s) => s.t === 'enter').map((s) => sim.spots.get((s as { spot: string }).spot)?.kind);
+    };
+    expect(plan('iza')).not.toContain('cafe_seat');
+    expect(plan('ana')).toContain('cafe_seat');
   });
 
   it('cafeSeatAfter: sentar na copa só depois do café da copa do principal', () => {
@@ -841,6 +866,29 @@ describe('salas sem buracos', () => {
     const coffees = sim.spots.ofKind('coffee');
     expect(cafeSeatAfter(coffees.find((s) => s.areaId === 'core:copa')!)).toBe(true);
     expect(cafeSeatAfter(coffees.find((s) => s.areaId === 'anexo:0,1:saguao')!)).toBe(false);
+  });
+
+  it('applySnapshot não duplica sala nem agente injetados que já vieram no snapshot (o store os reflete)', () => {
+    const sim = newSim();
+    const r = room('/a', 0);
+    const a = agent('ana', '/a', 'working');
+    sim.injected.rooms.push(r);
+    sim.injected.agents.push(a);
+    sim.applySnapshot(snap([r], [a], 1), T0);
+    expect([...sim.rooms.keys()]).toEqual(['/a']);
+    expect([...sim.chars.keys()]).toEqual(['ana']);
+  });
+
+  it('relayout sem mudança de blocos nem de salas não refaz o prédio nem invalida caminhos', () => {
+    const sim = newSim();
+    const clock = { now: T0 };
+    sim.applySnapshot(snap([room('/a', 0)], [agent('ana', '/a', 'working')], 1), clock.now);
+    run(sim, clock, 0.5);
+    const before = sim.building;
+    const v = sim.layoutVersion;
+    sim.relayout();
+    expect(sim.building).toBe(before);
+    expect(sim.layoutVersion).toBe(v);
   });
 });
 

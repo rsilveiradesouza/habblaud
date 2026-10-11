@@ -573,7 +573,7 @@ describe('núcleo por bloco (coreAreas)', () => {
     expect(core.coreAreas({ bx: 0, by: 0 })).toBe(areas());
   });
 
-  it('as funções de área aceitam o retângulo antigo (x 0 e 16): nada se move antes da virada', () => {
+  it('as funções de área aceitam qualquer retângulo de coluna (x 0 e 16): nada depende da posição antiga', () => {
     const reception = core.layoutReception({ x: 0, y: 0, w: 16, h: 12 });
     expect(reception.rect).toEqual({ x: 0, y: 0, w: 16, h: 12 });
     expect(reception.walkable).toEqual([{ x: 1, y: 2, w: 14, h: 10 }]);
@@ -970,18 +970,35 @@ describe('área externa por blocos', () => {
   });
 
   it('Review Focus 5: nenhum prop externo cai sob a passarela nem dentro do retângulo de pé do anexo', () => {
-    const blocks = existingBlocks([8]);
-    const bridges = bridgesFor(blocks);
-    const ext = layoutExterior(blocks, bridges);
-    const annex = blocks[1].rect;
-    for (const p of ext.props) {
-      const tx = Math.floor(p.x / TILE);
-      const ty = Math.floor(p.y / TILE);
-      expect(tx >= annex.x && tx < annex.x + annex.w && ty >= annex.y && ty < annex.y + annex.h, `${p.kind} em ${tx},${ty} dentro do anexo`).toBe(false);
-      for (const r of bridges[0].rects) expect(tx >= r.x && tx < r.x + r.w && ty >= r.y && ty < r.y + r.h, `${p.kind} em ${tx},${ty} sob a passarela`).toBe(false);
+    const half: Partial<Record<string, number>> = { tree: 18, pine: 14 };
+    for (const n of [9, 13, 24]) {
+      const blocks = existingBlocks(Array.from({ length: n }, (_, i) => i));
+      const bridges = bridgesFor(blocks);
+      const ext = layoutExterior(blocks, bridges);
+      const annex = blocks[1].rect;
+      const ax0 = annex.x * TILE;
+      const ax1 = (annex.x + annex.w) * TILE;
+      for (const p of ext.props) {
+        const tx = Math.floor(p.x / TILE);
+        const ty = Math.floor(p.y / TILE);
+        expect(tx >= annex.x && tx < annex.x + annex.w && ty >= annex.y && ty < annex.y + annex.h, `${p.kind} em ${tx},${ty} dentro do anexo`).toBe(false);
+        for (const r of bridges[0].rects) expect(tx >= r.x && tx < r.x + r.w && ty >= r.y && ty < r.y + r.h, `${p.kind} em ${tx},${ty} sob a passarela`).toBe(false);
+        // a copa (meia-largura do sprite) não entra na faixa do anexo quando a base está na altura dele
+        const h = half[p.kind] ?? 0;
+        if (h && ty >= annex.y && ty < annex.y + annex.h) expect(p.x + h > ax0 && p.x - h < ax1, `${p.kind} em ${p.x},${p.y} cobre a parede do anexo (${n} salas)`).toBe(false);
+      }
     }
-    // sem anexo nem passarela, a cena da fase 1 não muda (mesmos props, na mesma ordem)
-    expect(layoutExterior(existingBlocks([0, 1]), []).props).toEqual(layoutExterior(existingBlocks([0, 1])).props);
+    // sem anexo nem passarela, a cena da fase 1 não muda: contagem e digest dos props pinados em 2ce1063
+    // (1, 4 e 8 salas; qualquer filtro novo que tire ou mova um prop do principal quebra aqui)
+    const digest = (ps: readonly { x: number; y: number }[]) => ps.reduce((d, p) => (d * 31 + p.x * 7 + p.y) % 1_000_003, 0);
+    for (const [n, count, dg] of [
+      [1, 190, 644779],
+      [4, 212, -411479],
+      [8, 274, -45475],
+    ] as const) {
+      const ps = layoutExterior(existingBlocks(Array.from({ length: n }, (_, i) => i))).props;
+      expect([ps.length, digest(ps)], `${n} salas`).toEqual([count, dg]);
+    }
   });
 
   it('cerca viva ao norte do anexo 1 (y 40): cobre o retângulo de pé menos as peças sob a passarela, abre só diante da coluna da sala', () => {

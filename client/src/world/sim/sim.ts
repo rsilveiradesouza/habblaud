@@ -7,7 +7,7 @@ import type { WorldOptions } from '../api';
 import { COL_W, COMPACT_DELAY_MS, DISMANTLE_DELAY_MS, FOOT_DX, FOOT_DY, MISSING_DEBOUNCE_MS, RUN_SPEED, TILE, WALK_SPEED } from '../constants';
 import { assembleBuilding, type BuildingLayout } from '../layout/building';
 import { CAFE_ID, RECEPTION_ID } from '../layout/core';
-import { existingBlocks, inRect, occupiedRegions, regionAt, regionKey, retainRegions } from '../layout/geometry';
+import { existingBlocks, inRect, occupiedRegions, regionAt, regionKey, retainRegions, standingKey } from '../layout/geometry';
 import { layoutProjectRoom } from '../layout/room';
 import type { SpotDef, SpotKind } from '../layout/types';
 import { PathFinder } from '../path/astar';
@@ -140,7 +140,12 @@ export class Sim {
   // =================================================================== snapshot
 
   applySnapshot(input: OfficeSnapshot, now: number): void {
-    let snap = this.injected.rooms.length || this.injected.agents.length ? { ...input, rooms: [...input.rooms, ...this.injected.rooms], agents: [...input.agents, ...this.injected.agents] } : input;
+    // o injetado pelo depurador entra uma vez só: o store já o reflete no snapshot que chega daqui
+    const { rooms: injR, agents: injA } = this.injected;
+    let snap =
+      injR.length || injA.length
+        ? { ...input, rooms: [...input.rooms, ...injR.filter((r) => !input.rooms.some((x) => x.id === r.id))], agents: [...input.agents, ...injA.filter((a) => !input.agents.some((x) => x.id === a.id))] }
+        : input;
     if (this.agentPatches.size) {
       const patches = this.agentPatches;
       snap = { ...snap, agents: snap.agents.map((a) => (patches.has(a.id) ? { ...a, ...patches.get(a.id) } : a)) };
@@ -508,7 +513,11 @@ export class Sim {
       blocks = kept.blocks;
       this.shrinkPending = kept.retained;
     }
-    const building = assembleBuilding(blocks, present.map((r) => r.layout), this.layoutVersion + 1);
+    // nada mudou (mesmos blocos de pé, mesmas salas com os mesmos layouts): não refaz o prédio nem mexe nos caminhos
+    const layouts = present.map((r) => r.layout);
+    const same = !force && standingKey(blocks) === standingKey(this.building.blocks) && layouts.length === this.building.rooms.length && layouts.every((l, i) => l === this.building.rooms[i]);
+    if (same) return;
+    const building = assembleBuilding(blocks, layouts, this.layoutVersion + 1);
     this.building = building;
     this.layoutVersion++;
     this.finder.setGrid(building.grid);
@@ -626,7 +635,8 @@ export class Sim {
 
   /**
    * Sem buracos entre as salas: quando uma vaga fica livre antes da última sala (um terminal fechou e a
-   * sala foi desmontada), a sala mais distante se muda para ela depois de COMPACT_DELAY_MS. Uma sala por
+   * sala foi desmontada), a sala da maior vaga (a mais nova no prédio, não a mais longe da porta) se muda para
+   * ela depois de COMPACT_DELAY_MS. Uma sala por
    * vez, só sala pronta e com a sessão aberta; o prédio encolhe quando o endereço antigo é desmontado.
    */
   private compact(now: number): void {
@@ -1454,12 +1464,13 @@ export class Sim {
 
   /**
    * Spot livre de um serviço (café, água, cabine, pia) para `ch`: primeiro na mesma região (bloco) em que ele está
-   * (spec 7.3), senão em qualquer lugar. `near` manda na distância (padrão: o tile de `ch`); `rng` sorteia entre os 3
-   * mais próximos.
+   * (spec 7.3), senão em qualquer lugar. `near` manda na distância (padrão: o tile de `ch`); `at` é o tile cuja região
+   * manda (padrão: o de `ch`; a pia depois da cabine usa a cabine); `rng` sorteia entre os 3 mais próximos.
    */
-  serviceSpot(kind: 'coffee' | 'water' | 'stall' | 'sink', ch: Character, opts: { near?: { tx: number; ty: number }; rng?: () => number } = {}): SpotDef | null {
+  serviceSpot(kind: 'coffee' | 'water' | 'stall' | 'sink', ch: Character, opts: { near?: { tx: number; ty: number }; at?: { tx: number; ty: number }; rng?: () => number } = {}): SpotDef | null {
     const near = opts.near ?? { tx: ch.tx, ty: ch.ty };
-    const here = this.regionOf(ch.tx, ch.ty);
+    const at = opts.at ?? { tx: ch.tx, ty: ch.ty };
+    const here = this.regionOf(at.tx, at.ty);
     if (here) {
       const same = this.spots.findFree(kind, { near, by: ch.id, rng: opts.rng, filter: (s) => this.regionOf(s.tx, s.ty) === here });
       if (same) return same;
@@ -1474,12 +1485,13 @@ export class Sim {
     return cands[Math.floor(ch.rng() * cands.length)];
   }
 
-  private planOuting(ch: Character, now: number): boolean {
+  /** Planeja uma saída ociosa; `what` (testes) força a atividade em vez de sortear. */
+  private planOuting(ch: Character, now: number, what?: IdleActivity): boolean {
     const near = { tx: ch.tx, ty: ch.ty };
     const rng = ch.rng;
     const persona = personaFor(ch.info.seed);
     // colegas à toa: a vontade é de companhia (a personalidade dosa) — TV, jogo, papo, aposta...
-    if (this.social.hasCompany(ch, now) && rng() < 0.45 + persona.sociability * 0.4 && this.social.tryInitiate(ch, now, false)) return true;
+    if (!what && this.social.hasCompany(ch, now) && rng() < 0.45 + persona.sociability * 0.4 && this.social.tryInitiate(ch, now, false)) return true;
     const avail: Partial<Record<IdleActivity, boolean>> = {
       coffee: !!this.spots.findFree('coffee', { by: ch.id }),
       water: !!this.spots.findFree('water', { by: ch.id }),
@@ -1496,7 +1508,7 @@ export class Sim {
       mirror: !!this.social.plan('mirror', 1, ch),
       phone: !!this.randomFree(PHONE_SEATS, ch),
     };
-    const what = pickIdleActivity(rng, avail, soloWeights(persona));
+    what ??= pickIdleActivity(rng, avail, soloWeights(persona)) ?? undefined;
     if (!what) return false;
     const steps: Step[] = [];
     const goUse = (s: SpotDef, held: 'none' | 'coffee' = 'none'): void => {
@@ -1544,7 +1556,7 @@ export class Sim {
         this.pushLeave(ch, steps);
         steps.push({ t: 'go', tx: s.tx, ty: s.ty }, { t: 'stall', spot: s.id, ms: between(rng, 5000, 12000), phase: 0 });
         release(s);
-        const sink = this.serviceSpot('sink', ch, { near: { tx: s.tx, ty: s.ty } });
+        const sink = this.serviceSpot('sink', ch, { near: { tx: s.tx, ty: s.ty }, at: { tx: s.tx, ty: s.ty } });
         if (sink && this.reserveTemp(ch, sink)) {
           goUse(sink);
           steps.push({ t: 'act', pose: 'use', ms: 2200 });
