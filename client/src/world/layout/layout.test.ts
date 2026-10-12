@@ -197,11 +197,16 @@ describe('montagem por blocos', () => {
     expect(b.spots.filter((s) => s.group === 'anexo:1,0:corredor:talk:1')).toHaveLength(2);
   });
 
-  it('Review Focus 4: sem anexo, a porta sul do lounge é caminhável mas o jardim abaixo fica fora da grade', () => {
+  it('Review Focus 4: sem passarela a parede sul do lounge é inteira (nenhum vão, tile da linha 28 bloqueado); com o anexo 1 abre', () => {
     const { b } = buildFor([0]);
-    expect(b.grid.walkable(56, 28)).toBe(true);
-    expect(b.grid.walkable(56, 29)).toBe(false);
+    const lounge = b.areas.find((a) => a.id === core.LOUNGE_ID)!;
+    expect(lounge.exit).toBeUndefined();
+    expect(lounge.walls.find((w) => w.kind === 'south')!.doorways).toBeUndefined();
+    expect(b.grid.walkable(56, 28)).toBe(false);
     expect(b.grid.inside(56, 29)).toBe(false);
+    const com = buildFor([8]).b;
+    expect(com.areas.find((a) => a.id === core.LOUNGE_ID)!.exit).toEqual({ x: 55, y: 28, w: 3, h: 1 });
+    expect(com.grid.walkable(56, 28)).toBe(true);
   });
 
   it('a 9ª sala (vaga 8) monta o anexo 1 com saguão, WC e corredor, e a passarela do lounge ao saguão', () => {
@@ -542,7 +547,7 @@ describe('núcleo por bloco (coreAreas)', () => {
   });
 
   it('porta sul do lounge (para a passarela): vão de 3 tiles na parede sul, tile da linha 28 caminhável e `exit` separado de `door`', () => {
-    const lounge = byId('core:lounge');
+    const lounge = core.coreAreas(PRINCIPAL, { lounge: true, cafe: true }).find((a) => a.id === 'core:lounge')!;
     expect(lounge.exit).toEqual({ x: 55, y: 28, w: 3, h: 1 });
     expect(lounge.walkable).toContainEqual({ x: 55, y: 28, w: 3, h: 1 });
     expect(lounge.door).toEqual({ x: 55, y: 17, w: 3, h: 2 }); // a porta do corredor não muda
@@ -555,7 +560,9 @@ describe('núcleo por bloco (coreAreas)', () => {
 
   it('o WC não tem porta externa; a recepção tem a entrada na parede sul (D9) e a copa a porta norte (D4)', () => {
     expect(byId('core:banheiros').exit).toBeUndefined();
-    expect(byId('core:copa').exit).toEqual({ x: 55, y: 0, w: 3, h: 2 }); // porta norte da copa (D4)
+    expect(core.coreAreas(PRINCIPAL, { lounge: false, cafe: true }).find((a) => a.id === 'core:copa')!.exit).toEqual({ x: 55, y: 0, w: 3, h: 2 }); // porta norte da copa (D4)
+    expect(byId('core:copa').exit).toBeUndefined(); // sem passarela a parede é inteira
+    expect(byId('core:lounge').exit).toBeUndefined();
     const reception = byId('core:recepcao');
     expect(reception.exit).toEqual({ x: 39, y: 28, w: 3, h: 1 });
     expect(reception.walkable).toContainEqual({ x: 39, y: 28, w: 3, h: 1 });
@@ -721,12 +728,15 @@ describe('saguão dos dois lados e porta da copa (fase 3, D1 e D4)', () => {
     expect(reach[b.grid.key(148, 42)]).toBe(1);
   });
 
-  it('copa: porta norte de 3 tiles (exit), caminhável até a linha 0; sem A6 o jardim fica fora da grade', () => {
-    const b = assembleBuilding(existingBlocks([0]), roomsFor([0]));
+  it('copa: parede norte inteira sem A6; com A6 porta norte de 3 tiles (exit), caminhável até a linha 0', () => {
+    const fechada = assembleBuilding(existingBlocks([0]), roomsFor([0])).areas.find((a) => a.id === core.CAFE_ID)!;
+    expect(fechada.exit).toBeUndefined();
+    expect(fechada.wallItems.some((w) => w.kind === 'door_frame')).toBe(false);
+    const b = assembleBuilding(existingBlocks([48]), roomsFor([48]));
     const cafe = b.areas.find((a) => a.id === core.CAFE_ID)!;
     expect(cafe.exit).toEqual({ x: 55, y: 0, w: 3, h: 2 });
     expect(b.grid.walkable(56, 0)).toBe(true);
-    expect(b.grid.inside(56, -1)).toBe(false);
+    expect(b.grid.walkable(56, -1)).toBe(true); // a passarela de A6 começa logo acima
     expect(cafe.wallItems.filter((w) => w.kind === 'window').map((w) => w.cx)).toEqual([(48 + 13.25) * TILE]);
     const frame = cafe.wallItems.find((w) => w.kind === 'door_frame')!;
     expect([frame.variant, frame.cx]).toEqual(['wide3', (48 + 8.5) * TILE]);
@@ -1117,13 +1127,15 @@ describe('área externa por blocos', () => {
     expect(street[0]).toMatchObject({ y: (BUILDING_H + 4) * TILE, h: 5 * TILE });
     expect(ext.floors.filter((f) => f.kind === 'sidewalk').map((f) => f.y / TILE).sort((a, b) => a - b)).toEqual([29, 31, 38]);
     expect(ext.streetY).toBe((BUILDING_H + 4) * TILE);
-    // os postes ficam na mesma calçada e nas mesmas posições que sem o anexo (grade fixa x ≡ 4 mod 10, de 14 a 84: o de
-    // x 94 fica fora dos bounds, que com [8] vão a x 92); o de x 54 fica a oeste da saída da passarela (tiles 55..57)
+    // os postes ficam numa grade fixa do mundo (de 6 em 6 tiles), então os que existem com e sem o anexo estão nas
+    // mesmas posições; nenhum junto à entrada
     const lamps = (slots: number[]) => layoutExterior(existingBlocks(slots)).props.filter((p) => p.kind === 'lamp').map((p) => [p.x, p.y]);
     const withAnnex = lamps([8]);
-    expect(withAnnex.map(([x]) => x / TILE)).toEqual([14, 24, 34, 44, 54, 64, 74, 84]);
-    expect(withAnnex.every(([, y]) => y === (BUILDING_H + 3) * TILE + 6)).toBe(true);
-    expect(lamps([0]).filter(([x]) => withAnnex.some(([ax]) => ax === x))).toEqual(withAnnex);
+    const north = withAnnex.filter(([, y]) => y === (BUILDING_H + 3) * TILE + 6);
+    expect(north.length).toBeGreaterThan(5);
+    expect(north.every(([x]) => (x / TILE) % 6 === 2)).toBe(true);
+    expect(north.some(([x]) => x / TILE >= ENTRANCE_X - 4 && x / TILE < ENTRANCE_X + ENTRANCE_W + 5)).toBe(false);
+    expect(lamps([0]).filter(([x, y]) => withAnnex.some(([ax, ay]) => ax === x && ay === y))).toEqual(lamps([0]).filter(([x]) => withAnnex.some(([ax]) => ax === x)));
   });
 
   it('Review Focus 5: nenhum prop externo cai sob a passarela nem dentro do retângulo de pé do anexo', () => {
@@ -1149,9 +1161,9 @@ describe('área externa por blocos', () => {
     // props com 1, 4 e 8 salas; qualquer mudança que tire ou mova um prop do principal quebra aqui e exige re-pinar
     const digest = (ps: readonly { x: number; y: number }[]) => ps.reduce((d, p) => (d * 31 + p.x * 7 + p.y) % 1_000_003, 0);
     for (const [n, count, dg] of [
-      [1, 188, 132789],
-      [4, 211, -590213],
-      [8, 281, -367917],
+      [1, 311, 504912],
+      [4, 353, -466083],
+      [8, 446, -831433],
     ] as const) {
       const ps = layoutExterior(existingBlocks(Array.from({ length: n }, (_, i) => i))).props;
       expect([ps.length, digest(ps)], `${n} salas`).toEqual([count, dg]);
@@ -1226,7 +1238,7 @@ describe('exterior da fase 3 (D5): ruas, props por posição, cercas e pátios p
   });
 
   it('Review Focus 4: nenhum prop em rua, calçada, bloco ou passarela com 17, 33 e 49 salas (menos o mobiliário da calçada); carros só na principal', () => {
-    const sidewalkFurniture = new Set(['lamp', 'bench', 'totem', 'traffic_light']);
+    const sidewalkFurniture = new Set(['lamp', 'bench', 'totem', 'traffic_light', 'stop_sign']);
     for (const n of [17, 33, 49]) {
       const { b, e } = ext(n);
       const bridges = bridgesFor(b);
@@ -1269,10 +1281,16 @@ describe('exterior da fase 3 (D5): ruas, props por posição, cercas e pátios p
   });
 
   it('postes na calçada norte da rua principal e na calçada sul da rua norte; nenhum nas norte–sul', () => {
-    const lamps = ext(49).e.props.filter((p) => p.kind === 'lamp');
-    expect(new Set(lamps.map((p) => p.y))).toEqual(new Set([(29 + 3) * TILE + 6, -3 * TILE + 6]));
-    const lamps33 = ext(33).e.props.filter((p) => p.kind === 'lamp');
-    expect(new Set(lamps33.map((p) => p.y))).toEqual(new Set([(29 + 3) * TILE + 6]));
+    for (const n of [33, 49]) {
+      const { e } = ext(n);
+      const lamps = e.props.filter((p) => p.kind === 'lamp');
+      for (const s of e.streets.filter((s) => s.axis === 'v')) {
+        const asphalt = { x: s.rect.x + 3, y: s.rect.y, w: 5, h: s.rect.h };
+        for (const l of lamps) expect(inRect(asphalt, Math.floor(l.x / TILE), Math.floor(l.y / TILE)), `poste em ${l.x},${l.y} no asfalto (${n} salas)`).toBe(false);
+      }
+    }
+    const rows = new Set(ext(49).e.props.filter((p) => p.kind === 'lamp').map((p) => p.y));
+    expect(rows.has((29 + 3) * TILE + 6) && rows.has(-3 * TILE + 6)).toBe(true);
   });
 
   it('pátios: caminho de pedra e paving só do lado com rua (D5)', () => {
@@ -1284,5 +1302,41 @@ describe('exterior da fase 3 (D5): ruas, props por posição, cercas e pátios p
     // sem `street`, vale a regra antiga: só o sul do principal
     expect(slotShell(2, { west: false, east: false }).props.some((p) => p.kind === 'paving')).toBe(true);
     expect(slotShell(0, { west: false, east: false }).props.some((p) => p.kind === 'paving')).toBe(false);
+  });
+});
+
+describe('cruzamentos de cidade: faixas, PARE e placas', () => {
+  const ext = (slots: number[]) => layoutExterior(existingBlocks(slots));
+
+  it('sem rua norte–sul não há cruzamento nem placa', () => {
+    const e = ext([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(e.intersections).toEqual([]);
+    expect(e.props.some((p) => p.kind === 'stop_sign')).toBe(false);
+  });
+
+  it('um cruzamento de 5×5 tiles por par rua norte–sul × rua leste–oeste, no asfalto das duas', () => {
+    const e = ext([16]);
+    const v = e.streets.filter((s) => s.axis === 'v');
+    const h = e.streets.filter((s) => s.axis === 'h');
+    expect(e.intersections).toHaveLength(v.length * h.length);
+    for (const i of e.intersections) {
+      expect([i.w, i.h]).toEqual([5, 5]);
+      expect(v.some((s) => i.x === s.rect.x + 3)).toBe(true);
+      expect(h.some((s) => i.y === s.rect.y + 4)).toBe(true);
+    }
+  });
+
+  it('duas placas de PARE por cruzamento, na calçada da rua norte–sul (oeste ao norte, leste ao sul), nunca no asfalto', () => {
+    const e = ext([16, 32]);
+    const signs = e.props.filter((p) => p.kind === 'stop_sign');
+    expect(signs).toHaveLength(e.intersections.length * 2);
+    for (const i of e.intersections) {
+      const vx = i.x - 3;
+      const hy = i.y - 4;
+      const norte = signs.find((p) => Math.floor(p.x / TILE) === vx + 2 && Math.floor(p.y / TILE) === hy + 1);
+      const sul = signs.find((p) => Math.floor(p.x / TILE) === vx + 9 && Math.floor(p.y / TILE) === hy + 11);
+      expect(norte, `norte em ${i.x},${i.y}`).toBeDefined();
+      expect(sul, `sul em ${i.x},${i.y}`).toBeDefined();
+    }
   });
 });
