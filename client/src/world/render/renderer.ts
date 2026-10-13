@@ -230,8 +230,9 @@ export class Renderer {
       const r = s.rect;
       if (s.axis === 'h') {
         const ly = r.y * TILE + 6 * TILE + TILE / 2 - 1;
-        // mesma fase das faixas além da base (x ≡ 4 mod 24 a partir de 0): a emenda não pula
-        for (let x = Math.ceil((r.x * TILE - 4) / 24) * 24 + 4; x < (r.x + r.w) * TILE; x += 24) {
+        // mesma fase das faixas além da base (x ≡ 4 mod 24 a partir de 0): a emenda não pula. Começa no traço que
+        // atravessa a borda (floor, não ceil): a metade dele que cai dentro da base é pintada aqui
+        for (let x = Math.floor((r.x * TILE - 4) / 24) * 24 + 4; x < (r.x + r.w) * TILE; x += 24) {
           if (asphaltV.some(([x0, x1]) => x + 12 > x0 && x < x1)) continue;
           // sem tracejado dentro da faixa de pedestres
           if (s.cars && x + 12 > ENTRANCE_X * TILE - 4 && x < (ENTRANCE_X + ENTRANCE_W) * TILE + 4) continue;
@@ -239,7 +240,7 @@ export class Renderer {
         }
       } else {
         const lx = r.x * TILE + 5 * TILE + TILE / 2 - 1;
-        for (let y = Math.ceil((r.y * TILE - 4) / 24) * 24 + 4; y < (r.y + r.h) * TILE; y += 24) {
+        for (let y = Math.floor((r.y * TILE - 4) / 24) * 24 + 4; y < (r.y + r.h) * TILE; y += 24) {
           if (asphaltH.some(([y0, y1]) => y + 12 > y0 && y < y1)) continue;
           ctx.fillRect(lx, y, 2, 12);
         }
@@ -438,7 +439,9 @@ export class Renderer {
     const by0 = this.baseY;
     const bx1 = bx0 + this.base.width;
     const by1 = by0 + this.base.height;
-    if (vx0 >= bx0 && vy0 >= by0 && vx1 <= bx1 && vy1 <= by1) return;
+    // a base vai por cima sem a borda externa (SEAM_OVERLAP): com a câmera no limite de pan a borda da janela
+    // coincide com a da base, e esses 2 px precisam do campo por baixo e das ruas além
+    if (vx0 >= bx0 + SEAM_OVERLAP && vy0 >= by0 + SEAM_OVERLAP && vx1 <= bx1 - SEAM_OVERLAP && vy1 <= by1 - SEAM_OVERLAP) return;
     const pattern = this.grassBeyondPattern();
     if (!pattern) return;
     const ctx = this.ctx;
@@ -478,12 +481,12 @@ export class Renderer {
       if (s.axis === 'h') {
         // origem do padrão na linha da rua (x em múltiplos de 96 a partir de 0, como o tracejado da base)
         ctx.translate(0, r.y * TILE);
-        if (vx0 < bx0) ctx.fillRect(vx0 - 1, 0, bx0 - vx0 + 1 + SEAM_OVERLAP, r.h * TILE);
-        if (vx1 > bx1) ctx.fillRect(bx1 - SEAM_OVERLAP, 0, vx1 - bx1 + 1 + SEAM_OVERLAP, r.h * TILE);
+        if (vx0 < bx0 + SEAM_OVERLAP) ctx.fillRect(vx0 - 1, 0, bx0 - vx0 + 1 + SEAM_OVERLAP, r.h * TILE);
+        if (vx1 > bx1 - SEAM_OVERLAP) ctx.fillRect(bx1 - SEAM_OVERLAP, 0, vx1 - bx1 + 1 + SEAM_OVERLAP, r.h * TILE);
       } else {
         ctx.translate(r.x * TILE, 0);
-        if (vy0 < by0) ctx.fillRect(0, vy0 - 1, r.w * TILE, by0 - vy0 + 1 + SEAM_OVERLAP);
-        if (vy1 > by1) ctx.fillRect(0, by1 - SEAM_OVERLAP, r.w * TILE, vy1 - by1 + 1 + SEAM_OVERLAP);
+        if (vy0 < by0 + SEAM_OVERLAP) ctx.fillRect(0, vy0 - 1, r.w * TILE, by0 - vy0 + 1 + SEAM_OVERLAP);
+        if (vy1 > by1 - SEAM_OVERLAP) ctx.fillRect(0, by1 - SEAM_OVERLAP, r.w * TILE, vy1 - by1 + 1 + SEAM_OVERLAP);
       }
       ctx.restore();
     }
