@@ -1,7 +1,9 @@
 // Descrição das ferramentas do Codex: o que o personagem está fazendo em cada chamada (comando, patch, MCP, busca na web,
 // plano, multiagente...), pelo nome que ela tem no rollout, no hook ou no app. O texto livre do modelo passa pela
 // máscara (rollout-mask.ts) antes de qualquer corte.
+import { fileURLToPath } from 'node:url';
 import { describePrompt, describeTool, truncate, type ActivityDescription } from '../../../shared/activity';
+import { tr } from '../../../shared/i18n';
 import type { TaskItem, TaskStatus } from '../../../shared/types';
 import { unwrapCommand } from './command';
 import { ACTIVITY_TEXT_MAX, maskedCut, maskedInput, maskedQuestions, maskedText, plainText } from './rollout-mask';
@@ -79,20 +81,26 @@ export function fileChanges(raw: unknown): FileChangeEntry[] {
 }
 
 /**
- * Caminho de um `file://` (cwd e caminhos do Codex vêm como URL). No Windows a URL é `file:///C:/x/y` e o caminho é
- * `C:/x/y` (sem a barra antes da letra do drive), em qualquer plataforma: o Docker também lê rollouts do Windows.
+ * Caminho de um `file://` (cwd e caminhos do Codex vêm como URL). Drive (`file:///C:/x/y` → `C:\x\y`) ou host UNC
+ * viram caminho Windows em qualquer plataforma: o Docker também lê rollouts gravados no Windows.
  */
 export function pathFromUri(v: unknown): string | undefined {
   const s = str(v);
   if (!s) return undefined;
   if (!s.startsWith('file://')) return s;
-  let path: string;
   try {
-    path = decodeURIComponent(new URL(s).pathname);
+    const url = new URL(s);
+    const path = decodeURIComponent(url.pathname);
+    // localhost o parser do file:// já esvazia; host que sobra é UNC. Letra de drive também é Windows.
+    const windows = (url.hostname !== '' && url.hostname !== 'localhost') || /^\/[A-Za-z]:/.test(path);
+    return fileURLToPath(url, { windows });
   } catch {
-    path = s.slice('file://'.length);
+    try {
+      return decodeURIComponent(new URL(s).pathname);
+    } catch {
+      return s.slice('file://'.length);
+    }
   }
-  return /^\/[A-Za-z]:(?:[/\\]|$)/.test(path) ? path.slice(1) : path;
 }
 
 /** Argumentos de uma chamada de função: string JSON (o normal) ou objeto. */
@@ -144,7 +152,7 @@ export function deliveredMessage(line: Rec): { id?: string; text: string } | und
 export function describeCodexPrompt(text: string): ActivityDescription {
   // O detalhe sai do describePrompt, que corta antes de mascarar: ele recebe o texto já mascarado.
   const masked = maskedCut(text);
-  return { ...describePrompt(masked), text: truncate(`Recebeu “${truncate(masked, 34)}”`, 46) };
+  return { ...describePrompt(masked), text: truncate(tr('Recebeu “{0}”', [truncate(masked, 34)]), 46) };
 }
 
 const PLAN_STATUS = new Set<string>(['pending', 'in_progress', 'completed']);
@@ -247,7 +255,7 @@ function looseJson(literal: string): string {
 const DOTTED_NAMESPACES = new Set(['web', 'clock']);
 
 export function sleepDesc(): ActivityDescription {
-  return { kind: 'wait', icon: '⏳', text: 'Esperando um pouco' };
+  return { kind: 'wait', icon: '⏳', text: tr('Esperando um pouco') };
 }
 
 /** Busca na web (Extension web.search): página aberta vira leitura (WebFetch); senão a busca (WebSearch). */
@@ -281,11 +289,11 @@ function webRunDesc(input: Rec): { desc: ActivityDescription; tool: string } {
  */
 function messageLabel(target: unknown, self: string | undefined): string {
   const t = typeof target === 'string' ? target.trim() : '';
-  if (t === '/root') return 'Mensagem para o agente principal';
-  if (t && !t.startsWith('/')) return 'Mensagem para um subagente';
-  if (self && (t ? t.startsWith(`${self}/`) : self === '/root')) return 'Mensagem para um subagente';
-  if (self && t && t === self.slice(0, self.lastIndexOf('/'))) return 'Mensagem para o agente pai';
-  return 'Mensagem entre agentes';
+  if (t === '/root') return tr('Mensagem para o agente principal');
+  if (t && !t.startsWith('/')) return tr('Mensagem para um subagente');
+  if (self && (t ? t.startsWith(`${self}/`) : self === '/root')) return tr('Mensagem para um subagente');
+  if (self && t && t === self.slice(0, self.lastIndexOf('/'))) return tr('Mensagem para o agente pai');
+  return tr('Mensagem entre agentes');
 }
 
 /**
@@ -307,7 +315,7 @@ export function describeCodexTool(rawName: string, input: Rec, namespace?: strin
       return { desc: describeTool('Bash', { command: maskedCut(command), description: maskedText(input.description) }), tool: 'Bash' };
     }
     case 'write_stdin':
-      return { desc: { kind: 'run', icon: '⌨️', text: 'Interagindo com um comando' }, tool: name };
+      return { desc: { kind: 'run', icon: '⌨️', text: tr('Interagindo com um comando') }, tool: name };
     case 'apply_patch': {
       const patch = typeof input.command === 'string' ? input.command : typeof input.input === 'string' ? input.input : typeof input.patch === 'string' ? input.patch : '';
       const files = patchFiles(patch);
@@ -320,9 +328,9 @@ export function describeCodexTool(rawName: string, input: Rec, namespace?: strin
     }
     case 'exec':
       // Code mode do app: o argumento é JavaScript; o comando legível só aparece no CommandExecution ao concluir.
-      return { desc: { kind: 'run', icon: '⚙️', text: 'Executando código' }, tool: name };
+      return { desc: { kind: 'run', icon: '⚙️', text: tr('Executando código') }, tool: name };
     case 'update_plan':
-      return { desc: { kind: 'plan', icon: '🗒️', text: 'Atualizando o plano' }, tool: name };
+      return { desc: { kind: 'plan', icon: '🗒️', text: tr('Atualizando o plano') }, tool: name };
     case 'view_image': {
       const path = str(input.path);
       return { desc: describeTool('Read', { file_path: path ?? 'imagem.png' }), tool: 'Read' };
@@ -337,23 +345,23 @@ export function describeCodexTool(rawName: string, input: Rec, namespace?: strin
       // Mensagem cifrada (0.160.1) ou ausente: rótulo neutro com o nome da tarefa, nunca o texto cifrado.
       const base = describeTool('Agent', { subagent_type: maskedText(input.agent_type) });
       const task = plainText(input.task_name);
-      return { desc: task ? { ...base, text: maskedCut(`Delegando ao subagente ${task}`, ACTIVITY_TEXT_MAX) } : base, tool: 'Agent' };
+      return { desc: task ? { ...base, text: maskedCut(tr('Delegando ao subagente {0}', [task]), ACTIVITY_TEXT_MAX) } : base, tool: 'Agent' };
     }
     case 'wait':
     case 'wait_agent':
-      return { desc: { kind: 'delegate', icon: '⏳', text: 'Esperando os subagentes' }, tool: name };
+      return { desc: { kind: 'delegate', icon: '⏳', text: tr('Esperando os subagentes') }, tool: name };
     case 'send_message':
       return { desc: { kind: 'communicate', icon: '💬', text: messageLabel(input.target, from.agentPath) }, tool: name };
     case 'send_input':
     case 'followup_task':
-      return { desc: { kind: 'communicate', icon: '💬', text: 'Mensagem para um subagente' }, tool: name };
+      return { desc: { kind: 'communicate', icon: '💬', text: tr('Mensagem para um subagente') }, tool: name };
     case 'close_agent':
-      return { desc: { kind: 'delegate', icon: '👥', text: 'Encerrando um subagente' }, tool: name };
+      return { desc: { kind: 'delegate', icon: '👥', text: tr('Encerrando um subagente') }, tool: name };
     case 'request_permissions':
-      return { desc: { kind: 'wait', icon: '🔐', text: 'Pedindo permissões' }, tool: name };
+      return { desc: { kind: 'wait', icon: '🔐', text: tr('Pedindo permissões') }, tool: name };
     case 'request_user_input':
       // Pergunta síncrona: o turno para até você responder (kind 'ask': o escritório não sobrepõe o "Precisa de você").
-      return { desc: { ...describeTool('AskUserQuestion', { questions: maskedQuestions(input.questions) }), text: 'Esperando você responder' }, tool: name };
+      return { desc: { ...describeTool('AskUserQuestion', { questions: maskedQuestions(input.questions) }), text: tr('Esperando você responder') }, tool: name };
     case 'web.run':
       return webRunDesc(input);
     case 'clock.sleep':

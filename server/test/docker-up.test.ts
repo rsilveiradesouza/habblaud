@@ -15,6 +15,8 @@ import {
   envFileKeys,
   envFileValue,
   hostTimeZone,
+  isPrivateGroup,
+  keyNeedsGroup,
   parseArgs,
   planCodexMounts,
   planMounts,
@@ -340,7 +342,7 @@ describe('docker-up: chave local do hook do Codex', () => {
   );
 
   it('monta SÓ o arquivo da chave, somente leitura e sem criar nada no host, em /keys/codex-hook.key, e passa o caminho em HABBLAUD_CODEX_HOOK_KEY', () => {
-    const yml = renderOverride([], new Date(0), undefined, undefined, codex, '/Users/fu$lano/.habblaud/codex-hook.key');
+    const yml = renderOverride([], new Date(0), undefined, undefined, codex, undefined, [], '/Users/fu$lano/.habblaud/codex-hook.key');
     expect(yml).toContain('HABBLAUD_CODEX_HOOK_KEY: "/keys/codex-hook.key"');
     expect(yml).toContain(
       '      - type: bind\n        source: "/Users/fu$$lano/.habblaud/codex-hook.key"\n        target: "/keys/codex-hook.key"\n        read_only: true\n        bind:\n          create_host_path: false',
@@ -355,6 +357,41 @@ describe('docker-up: chave local do hook do Codex', () => {
     for (const yml of [renderOverride([], new Date(0), undefined, undefined, codex), renderOverride([], new Date(0))]) {
       expect(yml).not.toContain('HABBLAUD_CODEX_HOOK_KEY');
       expect(yml).not.toContain('codex-hook.key');
+      expect(yml).not.toContain('group_add');
     }
+  });
+
+  it('com o grupo da chave: group_add com esse gid (o usuário do container lê a chave 0640); sem ele, nada', () => {
+    const yml = renderOverride([], new Date(0), undefined, undefined, codex, undefined, [], '/home/fulano/.habblaud/codex-hook.key', 1001);
+    expect(yml).toContain('    group_add:\n      - "1001"\n    volumes:');
+    expect(renderOverride([], new Date(0), undefined, undefined, codex, undefined, [], '/home/fulano/.habblaud/codex-hook.key')).not.toContain('group_add');
+    // O grupo só existe junto da chave.
+    expect(renderOverride([], new Date(0), undefined, undefined, codex, undefined, [], undefined, 1001)).not.toContain('group_add');
+  });
+
+  it('isPrivateGroup: o grupo só serve à chave se for só do usuário (nenhum outro membro nem outro usuário com ele como primário)', () => {
+    const passwd = 'root:x:0:0::/root:/bin/sh\nfulano:x:1001:1001::/home/fulano:/bin/bash\nciclano:x:1002:100::/home/ciclano:/bin/bash\n';
+    const group = 'root:x:0:\nusers:x:100:fulano\nfulano:x:1001:\nequipe:x:1003:fulano,beltrano\nproprio:x:1004:fulano\n';
+    expect(isPrivateGroup(1001, 1001, group, passwd)).toBe(true);
+    // O próprio usuário listado como membro não conta.
+    expect(isPrivateGroup(1004, 1001, group, passwd)).toBe(true);
+    // users: outro usuário (ciclano) tem como primário; equipe: outro membro.
+    expect(isPrivateGroup(100, 1001, group, passwd)).toBe(false);
+    expect(isPrivateGroup(1003, 1001, group, passwd)).toBe(false);
+    // Grupo ou usuário fora dos arquivos (LDAP, arquivos ilegíveis): na dúvida, não.
+    expect(isPrivateGroup(2000, 1001, group, passwd)).toBe(false);
+    expect(isPrivateGroup(1001, 1001, '', '')).toBe(false);
+    expect(isPrivateGroup(1001, 1001, 'fulano:x:1001:\r\n', 'fulano:x:1001:1001::/home/fulano:/bin/bash\r\n')).toBe(true);
+  });
+
+  it('keyNeedsGroup: só no Docker Engine em Linux com o uid do host diferente do usuário do container (1000)', () => {
+    expect(keyNeedsGroup('linux', 1001, false)).toBe(true);
+    expect(keyNeedsGroup('linux', 0, false)).toBe(true);
+    expect(keyNeedsGroup('linux', 1000, false)).toBe(false);
+    // Docker Desktop: o compartilhamento de arquivos cuida do dono.
+    expect(keyNeedsGroup('linux', 1001, true)).toBe(false);
+    expect(keyNeedsGroup('darwin', 501, false)).toBe(false);
+    expect(keyNeedsGroup('win32', undefined, false)).toBe(false);
+    expect(keyNeedsGroup('linux', undefined, false)).toBe(false);
   });
 });

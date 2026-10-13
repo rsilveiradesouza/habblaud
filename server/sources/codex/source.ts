@@ -57,7 +57,7 @@ import type { AgentSource } from '../source';
 import { FileTail } from '../tail';
 import type { TerminalParser } from '../terminal';
 import { detectCodexAccounts } from './accounts';
-import { readRolloutHead, RolloutIndex } from './files';
+import { readRolloutHead, RolloutIndex, samePath } from './files';
 import { ThreadNameIndex } from './history';
 import type { CodexLive } from './live';
 import { createLockProber, type LockProber } from './locks';
@@ -73,6 +73,7 @@ import { newTracker, type CodexAccount, type CodexSourceOptions, type ThreadTrac
 import { CodexUsage } from './source-usage';
 import { CodexWatchers } from './source-watch';
 import { createCodexTerminalParser } from './terminal';
+import { tr } from '../../../shared/i18n';
 
 export { FALLBACK_RECENT_MS, HOOK_PRESENCE_MS, LOCK_SETTLE_MS, SESSION_END_GRACE_MS, STALE_LOCK_MS } from './source-presence';
 export { scanPrefix } from './source-scan';
@@ -102,10 +103,10 @@ const PREFIX_HISTORY = 120;
 const BACKLOG_MAX = 400;
 /** Títulos de filhos (sinal spawn) guardados até o filho aparecer. */
 const SPAWN_TITLES_MAX = 256;
-const MAIN_ROLE = 'Agente principal (Codex)';
-const SUB_ROLE = 'Subagente (Codex)';
+const MAIN_ROLE = tr('Agente principal (Codex)');
+const SUB_ROLE = tr('Subagente (Codex)');
 /** Motivo da espera de um request_user_input aberto (o mesmo texto que o registro usa para uma pergunta). */
-const QUESTION_WAIT = 'responder uma pergunta';
+const QUESTION_WAIT = tr('responder uma pergunta');
 
 function roleOf(raw: string | undefined): string {
   if (!raw) return SUB_ROLE;
@@ -160,6 +161,7 @@ export class CodexSource implements AgentSource, CodexLive {
       accs: () => this.accs,
       schedule: () => this.schedule(),
       pump: (t, boot) => this.pump(t, boot),
+      load: (t, path) => this.load(t, path),
       turnTo: (t, open) => this.turnTo(t, open),
       reconcile: (t, now, via) => this.reconcile(t, now, via),
       decide: (t, status, at, waitingFor, live) => this.decide(t, status, at, waitingFor, live),
@@ -261,7 +263,7 @@ export class CodexSource implements AgentSource, CodexLive {
     try {
       this.poll(false);
     } catch (err) {
-      log.warnOnce(`codex-poll:${errMsg(err)}`, `Codex: falha no ciclo de leitura: ${errMsg(err)}`);
+      log.warnOnce(`codex-poll:${errMsg(err)}`, tr('Codex: falha no ciclo de leitura: {0}', [errMsg(err)]));
     }
   }
 
@@ -291,7 +293,7 @@ export class CodexSource implements AgentSource, CodexLive {
         try {
           this.syncThread(t, via, now, boot);
         } catch (err) {
-          log.warnOnce(`codex-thread:${key}:${errMsg(err)}`, `Codex: thread ${key}: ${errMsg(err)}`);
+          log.warnOnce(`codex-thread:${key}:${errMsg(err)}`, tr('Codex: thread {0}: {1}', [key, errMsg(err)]));
         }
         seen.set(key, via);
       }
@@ -306,7 +308,7 @@ export class CodexSource implements AgentSource, CodexLive {
         try {
           this.pump(t, false);
         } catch (err) {
-          log.warnOnce(`codex-thread:${key}:${errMsg(err)}`, `Codex: thread ${key}: ${errMsg(err)}`);
+          log.warnOnce(`codex-thread:${key}:${errMsg(err)}`, tr('Codex: thread {0}: {1}', [key, errMsg(err)]));
         }
       }
       const grace = t.kind === 'main' ? MAIN_GONE_GRACE_MS : t.kind === 'sub' && !t.subDone && t.status !== 'idle' ? SUB_FOLLOWUP_GRACE_MS : CLOSE_AFTER_MISSING_MS;
@@ -329,7 +331,7 @@ export class CodexSource implements AgentSource, CodexLive {
         this.reconcile(t, now, seen.get(t.key));
         if (t.inOffice) this.quietCheck(t, now);
       } catch (err) {
-        log.warnOnce(`codex-thread:${t.key}:${errMsg(err)}`, `Codex: thread ${t.key}: ${errMsg(err)}`);
+        log.warnOnce(`codex-thread:${t.key}:${errMsg(err)}`, tr('Codex: thread {0}: {1}', [t.key, errMsg(err)]));
       }
     }
     // Shells de cada árvore, a cada ciclo: expiração, o de quem entregou ou fechou passa ao principal, e o status.
@@ -433,7 +435,7 @@ export class CodexSource implements AgentSource, CodexLive {
     try {
       this.opts.onTurn(t.acc.id, threadId, open);
     } catch (err) {
-      log.warnOnce(`codex-turn:${errMsg(err)}`, `Codex: o aviso de turno ao canal paralelo falhou (${errMsg(err)}).`);
+      log.warnOnce(`codex-turn:${errMsg(err)}`, tr('Codex: o aviso de turno ao canal paralelo falhou ({0}).', [errMsg(err)]));
     }
   }
 
@@ -491,26 +493,25 @@ export class CodexSource implements AgentSource, CodexLive {
 
   /** Acha o rollout (sem pressa: no máximo a cada 3 s por thread) e lê o que for novo. */
   private pump(t: ThreadTracker, boot: boolean): void {
-    if (!t.tail) {
-      const now = this.now();
-      if (now < t.nextResolveAt) return;
+    const now = this.now();
+    if (now >= t.nextResolveAt) {
       t.nextResolveAt = now + (boot ? 0 : 3_000);
       const path = t.acc.index.find(t.threadId);
-      if (!path) {
-        if (t.acc.index.isCompressedOnly(t.threadId)) {
-          log.warnOnce('codex-zst', 'Codex: há conversas compactadas (.jsonl.zst) que o Habblaud ainda não lê; elas ficam sem detalhes.');
-        }
+      if (path && !samePath(path, t.tail?.path)) {
+        this.load(t, path);
         return;
       }
-      this.load(t, path);
-      return;
+      if (!path && !t.tail && t.acc.index.isCompressedOnly(t.threadId)) {
+        log.warnOnce('codex-zst', tr('Codex: há conversas compactadas (.jsonl.zst) que o Habblaud ainda não lê; elas ficam sem detalhes.'));
+      }
     }
+    if (!t.tail) return;
     for (let i = 0; i < 4; i++) {
       let r;
       try {
         r = t.tail.read();
       } catch (err) {
-        log.warnOnce(`codex-read:${t.key}`, `Codex: rollout de ${t.key} ilegível (${errMsg(err)}).`);
+        log.warnOnce(`codex-read:${t.key}`, tr('Codex: rollout de {0} ilegível ({1}).', [t.key, errMsg(err)]));
         return;
       }
       if (r.missing) {
@@ -545,11 +546,12 @@ export class CodexSource implements AgentSource, CodexLive {
    * ela se completar. O começo anterior à varredura vai em segundo plano (números, título e linha do tempo longa).
    */
   private load(t: ThreadTracker, path: string): void {
+    this.watchers.unwatch(t);
     const head = readRolloutHead(path);
     if (head.meta) this.setMeta(t, head.meta);
     const tail = new FileTail(path);
     tail.seekEnd(); // fixa o arquivo (inode) e o tamanho antes da varredura
-    const scan = scanBackward(path, { size: tail.size, isBoundary: boundaryAfter(this.tailBytes) });
+    const scan = scanBackward(path, { size: tail.size, isBoundary: boundaryAfter(this.tailBytes), maxBytes: this.opts.scanMaxBytes });
     tail.offset = scan.end;
     t.tail = tail;
     t.rolloutPath = path;
@@ -569,7 +571,7 @@ export class CodexSource implements AgentSource, CodexLive {
     }
     this.applySummary(t);
     this.watchers.watchFile(t, path);
-    if (scan.start > 0) this.queuePrefix(t, path, scan.start);
+    if (scan.start > 0) this.queuePrefix(t, path, scan.start, scan.hitBoundary);
   }
 
   private setMeta(t: ThreadTracker, meta: RolloutMeta): void {
@@ -744,9 +746,11 @@ export class CodexSource implements AgentSource, CodexLive {
 
   /**
    * Começo de um rollout grande (os bytes antes da varredura, sem sobreposição com ela): números, título e a linha do
-   * tempo longa. O status não sai daqui: a varredura já tem a fronteira de turno.
+   * tempo longa. O status só sai daqui quando a varredura bateu no teto sem achar a fronteira de turno (`hitBoundary`
+   * falso): como nenhuma fronteira veio depois, o turno termina como o começo o deixou. Uma fronteira lida ao vivo
+   * nesse meio-tempo vence.
    */
-  private queuePrefix(t: ThreadTracker, path: string, end: number): void {
+  private queuePrefix(t: ThreadTracker, path: string, end: number, hitBoundary: boolean): void {
     const state = t.state;
     this.prefixChain = this.prefixChain
       .then(async () => {
@@ -759,10 +763,16 @@ export class CodexSource implements AgentSource, CodexLive {
         state.model ??= prefix.state.model;
         if (!state.tasks.length && prefix.state.tasks.length) state.tasks = prefix.state.tasks;
         if (prefix.state.firstAt !== undefined && (state.firstAt === undefined || prefix.state.firstAt < state.firstAt)) state.firstAt = prefix.state.firstAt;
+        if (!hitBoundary && state.turnOpen === undefined && prefix.state.turnOpen !== undefined) {
+          state.turnOpen = prefix.state.turnOpen;
+          this.settleStatus(t);
+          this.turnTo(t, state.turnOpen);
+          this.statusToOffice(t);
+        }
         this.applySummary(t);
         if (t.inOffice) this.opts.office.mergeHistory(t.key, prefix.activities);
       })
-      .catch((err) => log.warnOnce(`codex-prefix:${path}`, `Codex: não foi possível ler o início de um rollout (${errMsg(err)}).`));
+      .catch((err) => log.warnOnce(`codex-prefix:${path}`, tr('Codex: não foi possível ler o início de um rollout ({0}).', [errMsg(err)])));
   }
 
   // ---------------------------------------------------------------- hooks (CodexLive)
@@ -771,7 +781,7 @@ export class CodexSource implements AgentSource, CodexLive {
     try {
       return this.hooks.hookEvent(account, input);
     } catch (err) {
-      log.warnOnce(`codex-hook:${errMsg(err)}`, `Codex: evento de hook ignorado (${errMsg(err)}).`);
+      log.warnOnce(`codex-hook:${errMsg(err)}`, tr('Codex: evento de hook ignorado ({0}).', [errMsg(err)]));
       return false;
     }
   }

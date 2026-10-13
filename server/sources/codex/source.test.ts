@@ -1,11 +1,12 @@
 // Integração da fonte do Codex: um CODEX_HOME temporário (rollouts e locks sintéticos), o AccountsService e o Office.
-import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { describeShellJob } from '../../../shared/activity';
 import type { AgentInfo, Notice, PermissionRequestInfo } from '../../../shared/types';
 import { AccountsService } from '../../accounts/service';
-import { setQuiet } from '../../log';
+import { log, setQuiet } from '../../log';
 import { NameStore } from '../../model/names';
 import { DONE_GRACE_MS, Office } from '../../model/office';
 import { PermissionRegistry } from '../../permissions/registry';
@@ -15,6 +16,7 @@ import { LIMIT_MESSAGE, taskCompleteError } from '../../test/codex-fixtures-fim'
 import { envelope, spawnEncrypted } from '../../test/codex-fixtures-live';
 import { B, commandParsed, forkRollout, grandchildSource, Q, S } from '../../test/codex-fixtures-source-ii';
 import { writeLines } from '../../test/fixtures';
+import { MAX_LINE_BYTES } from '../tail';
 import { readLocks, RolloutIndex } from './files';
 import { CodexSource, LOCK_SETTLE_MS, MAIN_GONE_GRACE_MS, scanPrefix, SHELL_EXPIRE_MS, SUB_FOLLOWUP_GRACE_MS, USAGE_RESCAN_MS } from './source';
 
@@ -42,6 +44,8 @@ function setup(
     env?: (dirs: string[]) => NodeJS.ProcessEnv;
     permissions?: () => ReadonlyMap<string, PermissionRequestInfo>;
     onTurn?: (account: string, threadId: string, open: boolean) => void;
+    /** Janela da leitura síncrona ao abrir um rollout (padrão: 1 MB e o SCAN_MAX_BYTES). */
+    scan?: { tailBytes: number; maxBytes: number };
   } = {},
 ) {
   const locks = fakeLockProber(opts.locks === 'exists' ? 'exists' : 'win32');
@@ -65,7 +69,19 @@ function setup(
   });
   late.office = office;
   const dirs = homes.map((h) => h.dir);
-  const source = new CodexSource({ accounts, office, dirs, env: opts.env?.(dirs) ?? {}, home: home.home, now, watch: false, lockProber: locks.prober, onTurn: opts.onTurn });
+  const source = new CodexSource({
+    accounts,
+    office,
+    dirs,
+    env: opts.env?.(dirs) ?? {},
+    home: home.home,
+    now,
+    watch: false,
+    lockProber: locks.prober,
+    onTurn: opts.onTurn,
+    tailBytes: opts.scan?.tailBytes,
+    scanMaxBytes: opts.scan?.maxBytes,
+  });
   // Para antes de apagar as pastas (nenhum ciclo agendado roda depois).
   cleanups.unshift(() => source.stop());
   const notices: Notice[] = [];
@@ -150,6 +166,102 @@ describe('fonte do Codex: presença pelos locks', () => {
     ctx.poll();
     expect(ctx.agent()?.status).toBe('offline');
     expect(ctx.notices.some((n) => n.text.includes('encerrou'))).toBe(true);
+  });
+
+  it('hook de thread revertido troca o rollout aberto e o caminho do terminal na hora', () => {
+    const ctx = setup();
+    const at = ctx.now() - 10_000;
+    const old = ctx.home.rollout(T, [
+      R.meta(T, { at }),
+      R.taskStarted('t1', at),
+      R.user(T, 't1', 'u1', 'Turno antigo', at + 1),
+      R.command(T, 't1', 'c1', 'npm test', { at: at + 2 }),
+      R.taskComplete('t1', at + 3),
+    ], { mtime: at + 3 });
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    expect(ctx.agent()).toMatchObject({ status: 'idle', title: 'Turno antigo', stats: { toolCalls: 1 } });
+    const path = old.replace('.jsonl', `_${C}.jsonl`);
+    writeFileSync(path, [
+      R.meta(T, { at }),
+      R.taskStarted('t2', ctx.now()),
+      R.user(T, 't2', 'u2', 'Turno revertido', ctx.now() + 1),
+    ].join('\n') + '\n');
+    ctx.home.touch(path, ctx.now());
+    expect(ctx.hook({ hook_event_name: 'SessionStart', session_id: T, transcript_path: path })).toBe(true);
+    expect(ctx.source.transcriptPathOf(KEY)).toBe(realpathSync(path));
+    expect(ctx.agent()).toMatchObject({ status: 'working', title: 'Turno revertido', stats: { toolCalls: 0 } });
+    // Continua lendo só o novo: a escrita no antigo não encerra o turno revertido.
+    ctx.home.append(old, [R.taskComplete('t1', ctx.now() + 2)]);
+    ctx.poll();
+    expect(ctx.agent()?.status).toBe('working');
+    ctx.home.append(path, [R.taskComplete('t2', ctx.now() + 3)]);
+    ctx.poll();
+    expect(ctx.agent()?.status).toBe('idle');
+  });
+
+  it('rollout aberto pelo hook não é recarregado à toa (caminho com symlink, varredura e hook repetido)', () => {
+    const ctx = setup();
+    const at = ctx.now() - 10_000;
+    const path = ctx.home.rollout(T, [R.meta(T, { at }), R.taskStarted('t1', at), R.user(T, 't1', 'u1', 'Turno', at + 1)], { mtime: at + 1 });
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    // O tmpdir do macOS passa por symlink (/var -> /private/var): o índice guarda um caminho e o hook manda o outro.
+    const load = vi.spyOn(ctx.source as unknown as { load: (...a: unknown[]) => void }, 'load');
+    ctx.hook({ hook_event_name: 'UserPromptSubmit', session_id: T, transcript_path: path });
+    ctx.advance(3_000);
+    ctx.poll();
+    ctx.hook({ hook_event_name: 'UserPromptSubmit', session_id: T, transcript_path: path });
+    ctx.advance(30_000);
+    ctx.poll();
+    expect(load.mock.calls.length <= 1).toBe(true);
+    load.mockRestore();
+  });
+
+  it.each([
+    { date: '2026/10/09', wait: 3_000 },
+    { date: '2026/01/02', wait: 30_000 },
+  ])('sem hook, revalida o rollout de thread revertido em $date sem perder as leituras entre varreduras', ({ date, wait }) => {
+    const ctx = setup();
+    const at = ctx.now() - 10_000;
+    const old = ctx.home.rollout(T, [R.meta(T, { at }), R.user(T, 't1', 'u1', 'Turno antigo', at + 1), R.taskComplete('t1', at + 2)], { date, mtime: at + 2 });
+    // A pasta antiga fica fora da varredura dos dois dias mais recentes.
+    ctx.home.rollout(threadId(3), [], { date: '2026/10/10' });
+    ctx.home.rollout(threadId(4), [], { date: '2026/10/09' });
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    expect(ctx.source.transcriptPathOf(KEY)).toBe(old);
+    expect(ctx.agent()).toMatchObject({ status: 'idle', title: 'Turno antigo' });
+    const path = old.replace('.jsonl', `_${C}.jsonl`);
+    writeFileSync(path, [R.meta(T, { at }), R.taskStarted('t2', ctx.now()), R.user(T, 't2', 'u2', 'Turno revertido', ctx.now() + 1)].join('\n') + '\n');
+    ctx.home.touch(path, ctx.now());
+    // Antes da próxima varredura, o tail atual ainda recebe linhas normalmente.
+    ctx.home.append(old, [R.command(T, 't1', 'c1', 'npm test', { at: at + 3 })]);
+    ctx.home.touch(old, at + 3);
+    ctx.poll();
+    expect(ctx.agent()?.stats.toolCalls).toBe(1);
+    expect(ctx.source.transcriptPathOf(KEY)).toBe(old);
+    ctx.advance(wait);
+    ctx.poll();
+    expect(ctx.source.transcriptPathOf(KEY)).toBe(path);
+    expect(ctx.agent()).toMatchObject({ status: 'working', title: 'Turno revertido', stats: { toolCalls: 0 } });
+  });
+
+  it('mantém o rollout em leitura quando seu mtime atual é mais novo que o de outro arquivo do thread', () => {
+    const ctx = setup();
+    const at = ctx.now() - 10_000;
+    const path = ctx.home.rollout(T, [R.meta(T, { at }), R.user(T, 't1', 'u1', 'Turno atual', at + 1), R.taskComplete('t1', at + 2)], { mtime: at + 2 });
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    const other = path.replace('.jsonl', `_${C}.jsonl`);
+    writeFileSync(other, [R.meta(T, { at }), R.user(T, 't2', 'u2', 'Outro rollout', at + 3), R.taskComplete('t2', at + 4)].join('\n') + '\n');
+    ctx.home.touch(other, at + 4);
+    ctx.home.append(path, [R.taskStarted('t3', ctx.now())]);
+    ctx.home.touch(path, ctx.now());
+    ctx.advance(3_000);
+    ctx.poll();
+    expect(ctx.source.transcriptPathOf(KEY)).toBe(path);
+    expect(ctx.agent()).toMatchObject({ status: 'working', title: 'Turno atual' });
   });
 
   it('lock rápido (manutenção) não vira sessão; o que persiste uns segundos, vira', () => {
@@ -315,6 +427,50 @@ describe('fonte do Codex: sondagem da trava, leitura até a fronteira e mtime fo
     expect(ctx.notices.some((n) => n.text.includes('encerrou'))).toBe(true);
   });
 
+  it('trava "livre" com o rollout crescendo há pouco não vale como órfã (outra máquina ou outro kernel); 60 s sem sinal de vida, sai', () => {
+    // Arrange: sessão no escritório com a trava segura.
+    const ctx = setup();
+    const at = ctx.now() - 10_000;
+    const path = ctx.home.rollout(T, [R.meta(T, { at }), R.taskStarted('t', at), R.user(T, 't', 'u', 'rode os testes', at)]);
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    expect(ctx.agent()?.status).toBe('working');
+
+    // Act: a sondagem passa a dizer "livre", mas o rollout continua crescendo.
+    ctx.locks.set(T, 'free');
+    ctx.advance(1_000);
+    ctx.home.append(path, [R.command(T, 't', 'c1', 'npm test', { at: ctx.now() })]);
+    ctx.poll();
+    ctx.advance(59_000);
+    ctx.poll();
+
+    // Assert
+    expect(ctx.agent()?.status).toBe('working');
+    ctx.advance(1_000);
+    ctx.poll();
+    ctx.advance(5_000);
+    ctx.poll();
+    expect(ctx.agent()?.status).toBe('offline');
+  });
+
+  it('trava "livre" com um hook recente também não vale como órfã', () => {
+    // Arrange
+    const ctx = setup();
+    const at = ctx.now() - 120_000;
+    const path = ctx.home.rollout(T, [R.meta(T, { at }), R.taskStarted('t', at), R.user(T, 't', 'u', 'rode os testes', at)]);
+    ctx.home.lock(T, at);
+    ctx.source.boot();
+    ctx.locks.set(T, 'free');
+
+    // Act
+    ctx.hook({ hook_event_name: 'PreToolUse', session_id: T, transcript_path: path, tool_name: 'Bash', tool_use_id: 'call_1', tool_input: { command: 'npm test' } });
+    ctx.advance(30_000);
+    ctx.poll();
+
+    // Assert
+    expect(ctx.agent()?.status).toBe('working');
+  });
+
   it('trava segura e turno aberto: 31 min sem escrever continua trabalhando (sem o "concluiu" falso)', () => {
     const ctx = setup();
     const at = ctx.now() - 60_000;
@@ -408,6 +564,32 @@ describe('fonte do Codex: sondagem da trava, leitura até a fronteira e mtime fo
     // O começo (antes da varredura) chega em segundo plano sem contar nada duas vezes.
     await ctx.source.idle();
     expect(ctx.agent()?.stats.toolCalls).toBe(parent.length);
+  });
+
+  it('turno aberto maior que o teto da leitura síncrona: o começo, lido depois em stream, diz que o turno está aberto', async () => {
+    const turns: boolean[] = [];
+    const ctx = setup({ scan: { tailBytes: 100_000, maxBytes: 300_000 }, onTurn: (_a, _t, open) => turns.push(open) });
+    const start = ctx.now() - 20 * 60_000;
+    // Última linha uns 17 min atrás: a regra do legacy (escreveu há menos de 90 s) não salvaria.
+    const parent = bigTurn(T, 'p1', 1_200_000, start + 2_000);
+    ctx.home.rollout(T, [R.meta(T, { at: start, cwd: '/projetos/loja' }), R.taskStarted('p1', start), R.user(T, 'p1', 'u', 'Refatore o módulo de pedidos', start + 1_000), ...parent]);
+    ctx.home.lock(T, start);
+    ctx.source.boot();
+    await ctx.source.idle();
+    expect(ctx.agent()).toMatchObject({ status: 'working', title: 'Refatore o módulo de pedidos', roomId: '/projetos/loja' });
+    expect(turns.at(-1)).toBe(true);
+    expect(ctx.agent()?.stats.toolCalls).toBe(parent.length);
+  });
+
+  it('turno fechado antes do teto da leitura síncrona: o começo não reabre o turno', async () => {
+    const ctx = setup({ scan: { tailBytes: 100_000, maxBytes: 300_000 } });
+    const start = ctx.now() - 20 * 60_000;
+    const turn = bigTurn(T, 't1', 600_000, start + 2_000);
+    ctx.home.rollout(T, [R.meta(T, { at: start, cwd: '/projetos/loja' }), R.taskStarted('t1', start), R.user(T, 't1', 'u', 'Revise', start + 1_000), ...turn, R.taskComplete('t1', ctx.now() - 60_000)]);
+    ctx.home.lock(T, start);
+    ctx.source.boot();
+    await ctx.source.idle();
+    expect(ctx.agent()).toMatchObject({ status: 'idle' });
   });
 
   it('sessão ociosa com rollout de mais de 1 MB: o boot lê pelo menos 1 MB do fim (os números do último turno vêm na hora)', async () => {
@@ -1930,5 +2112,32 @@ describe('fonte do Codex: rótulo do send_message pelo destino', () => {
     send(N, 'call_n', '/root/tarefa_filho');
     expect(ctx.agent()?.activity).toMatchObject({ id: `${KEY}#call_r`, text: 'Mensagem para um subagente' });
     expect(ctx.agent(NETO)?.activity).toMatchObject({ id: `${NETO}#call_n`, text: 'Mensagem para o agente pai' });
+  });
+});
+
+describe('scanPrefix do Codex', () => {
+  it('ignora linha acima do teto e lê as vizinhas', async () => {
+    const dir = join(tmpdir(), `habblaud-codex-prefix-${process.pid}`);
+    mkdirSync(dir, { recursive: true });
+    const warn = vi.spyOn(log, 'warnOnce').mockImplementation(() => {});
+    try {
+      const file = join(dir, 'rollout.jsonl');
+      const body = Buffer.concat([
+        Buffer.from(`${R.turnContext({ model: 'antes' })}\n`),
+        Buffer.from('{"timestamp":"2026-10-10T00:00:00.000Z","type":"turn_context","payload":{"model":"'),
+        Buffer.alloc(MAX_LINE_BYTES, 0x6e),
+        Buffer.from('"}}\n'),
+        Buffer.from(`${R.taskStarted('t1')}\n`),
+      ]);
+      writeFileSync(file, body);
+      const { state } = await scanPrefix(file, body.length, 'codex:teste', 0, Date.now());
+      // Booleano de propósito: o valor errado seria a linha gigante, e o diff não pode imprimi-la.
+      expect(state.model === 'antes').toBe(true);
+      expect(state.turnOpen).toBe(true);
+      expect(warn).toHaveBeenCalledWith(`oversize-line:${file}`, expect.stringContaining('8 MiB'));
+    } finally {
+      warn.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

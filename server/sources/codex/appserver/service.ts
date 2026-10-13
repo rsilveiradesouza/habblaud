@@ -18,10 +18,13 @@
 // - Nunca segura uma thread que o usuário fechou (assinada, a thread fica carregada no daemon com a trava de escritor
 //   presa): só assina thread que está no thread/loaded/list atual ou que acabou de chegar em thread/started (o resume de
 //   uma thread descarregada faria o daemon carregá-la), e desassina UNSUBSCRIBE_AFTER_MS depois de o turno dela fechar
-//   (setTurnOpen), até o turno reabrir.
+//   (setTurnOpen), até o turno reabrir. Com o turno aberto e nenhum evento da thread por STALE_RELEASE_MS (o TUI fechou
+//   no meio do turno, por exemplo esperando uma aprovação), também desassina: a presença não serve de sinal, porque a
+//   assinatura do Habblaud mantém a thread carregada e a trava presa.
 import { execFile, spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
+import { tr } from '../../../../shared/i18n';
 import type { CodexDecision } from '../../../../shared/types';
 import { errMsg, log } from '../../../log';
 import type { ParallelRequestInput, ParallelSink, PermissionRegistry } from '../../../permissions/registry';
@@ -37,6 +40,12 @@ export const BACKOFF_MAX_MS = 30_000;
 export const RESUME_RETRY_MS = 5_000;
 /** Turno fechado (setTurnOpen false): desassina a thread depois disto, se o turno não reabrir antes. */
 export const UNSUBSCRIBE_AFTER_MS = 60_000;
+/**
+ * Turno aberto sem nenhum evento da thread (notificação ou pedido do app-server, turno reaberto) por isto: desassina.
+ * O mesmo prazo máximo que o Codex dá a uma thread ociosa sem inscritos antes de descarregá-la. Um comando longo não
+ * manda eventos (a saída vem em deltas, que o Habblaud dispensa): passado o prazo, os pedidos seguintes voltam ao hook.
+ */
+export const STALE_RELEASE_MS = 30 * 60_000;
 /** Proxy aberto sem a conexão ficar pronta (101 + initialize) até aqui: cai e tenta de novo com backoff. */
 export const HANDSHAKE_TIMEOUT_MS = 15_000;
 /**
@@ -144,6 +153,8 @@ interface Conn {
   closed: boolean;
   /** Threads assinadas nesta conexão (owns). */
   owned: Set<string>;
+  /** Thread assinada → último evento dela (assinatura, notificação ou pedido do app-server, turno reaberto). */
+  activeAt: Map<string, number>;
   /** Threads com o resume em andamento. */
   resuming: Set<string>;
   /** Threads a tentar de novo (sem rollout, ou erro): thread → a partir de quando. */
@@ -195,7 +206,7 @@ export class CodexAppServerService implements ParallelSink {
   start(): void {
     if (this.timer || this.stopped) return;
     if (!this.opts.codexBin) {
-      this.say('Codex: sem o binário do Codex (codex no PATH ou HABBLAUD_CODEX_BIN): os pedidos do codex no terminal ficam só com o hook.');
+      this.say(tr('Codex: sem o binário do Codex (codex no PATH ou HABBLAUD_CODEX_BIN): os pedidos do codex no terminal ficam só com o hook.'));
       return;
     }
     this.timer = setInterval(() => this.tick(), this.opts.tickMs ?? TICK_MS);
@@ -207,7 +218,7 @@ export class CodexAppServerService implements ParallelSink {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    for (const st of [...this.states.values()]) if (st.conn) this.drop(st, st.conn, 'fechada pelo Habblaud');
+    for (const st of [...this.states.values()]) if (st.conn) this.drop(st, st.conn, tr('fechada pelo Habblaud'));
     this.states.clear();
     this.closedTurns.clear();
   }
@@ -225,7 +236,7 @@ export class CodexAppServerService implements ParallelSink {
         // Sai do mapa antes da queda: o drop não avisa "não ficou pronto" de uma conexão que o Habblaud mesmo fechou.
         this.states.delete(st.id);
         this.closedTurns.delete(st.id);
-        if (st.conn) this.drop(st, st.conn, 'a conta saiu da lista');
+        if (st.conn) this.drop(st, st.conn, tr('a conta saiu da lista'));
       }
       for (const a of accounts) {
         let st = this.states.get(a.id);
@@ -238,7 +249,7 @@ export class CodexAppServerService implements ParallelSink {
         } else if (!st.checking && now >= st.retryAt) this.check(st, bin);
       }
     } catch (err) {
-      log.warnOnce(`codex-appserver-tick:${errMsg(err)}`, `Codex: falha no relógio do canal paralelo (${errMsg(err)}).`);
+      log.warnOnce(`codex-appserver-tick:${errMsg(err)}`, tr('Codex: falha no relógio do canal paralelo ({0}).', [errMsg(err)]));
     }
   }
 
@@ -277,6 +288,7 @@ export class CodexAppServerService implements ParallelSink {
     this.turnReopened(account, threadId);
     const st = this.states.get(account);
     const conn = st?.conn;
+    if (conn?.owned.has(threadId)) conn.activeAt.set(threadId, this.now());
     if (!st || !conn?.ready || conn.closed || conn.owned.has(threadId) || conn.resuming.has(threadId)) return;
     // Nova tentativa vencida: a próxima listagem decide (assina se estiver carregada; senão desiste).
     conn.retry.set(threadId, this.now());
@@ -313,7 +325,7 @@ export class CodexAppServerService implements ParallelSink {
     try {
       proxy = (this.opts.spawnProxy ?? spawnCodexProxy)(bin, st.home);
     } catch (err) {
-      log.warnOnce(`codex-appserver-spawn:${errMsg(err)}`, `Codex (${st.id}): não consegui abrir o proxy do app-server (${errMsg(err)}).`);
+      log.warnOnce(`codex-appserver-spawn:${errMsg(err)}`, tr('Codex ({0}): não consegui abrir o proxy do app-server ({1}).', [st.id, errMsg(err)]));
       this.backoff(st);
       return;
     }
@@ -324,6 +336,7 @@ export class CodexAppServerService implements ParallelSink {
       ready: false,
       closed: false,
       owned: new Set(),
+      activeAt: new Map(),
       resuming: new Set(),
       retry: new Map(),
       notDaemon: new Set(),
@@ -336,9 +349,9 @@ export class CodexAppServerService implements ParallelSink {
     st.conn = conn;
     // Antes dos eventos (um proxy que já saiu chama o 'exit' na hora): o drop limpa o prazo.
     const handshakeMs = this.opts.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
-    conn.handshakeTimer = setTimeout(() => this.guard(() => this.drop(st, conn, `sem handshake em ${handshakeMs / 1000} s`)), handshakeMs);
+    conn.handshakeTimer = setTimeout(() => this.guard(() => this.drop(st, conn, tr('sem handshake em {0} s', [handshakeMs / 1000]))), handshakeMs);
     conn.handshakeTimer.unref?.();
-    proxy.on('exit', () => this.drop(st, conn, 'o proxy do app-server saiu'));
+    proxy.on('exit', () => this.drop(st, conn, tr('o proxy do app-server saiu')));
     client.on('close', (reason: string) => this.drop(st, conn, reason));
     client.on('approval', (req: ApprovalRequest) => this.guard(() => this.onApproval(st, conn, req)));
     client.on('approvalResolved', (r: { requestId: string | number }) => this.guard(() => this.onResolved(st, conn, r.requestId)));
@@ -353,6 +366,9 @@ export class CodexAppServerService implements ParallelSink {
       }),
     );
     client.on('threadClosed', (threadId: string) => this.guard(() => this.forget(conn, threadId)));
+    client.on('threadActivity', (threadId: string) => {
+      if (conn.owned.has(threadId)) conn.activeAt.set(threadId, this.now());
+    });
     client.start().then(
       () => this.guard(() => this.onReady(st, conn)),
       () => {
@@ -366,7 +382,7 @@ export class CodexAppServerService implements ParallelSink {
     clearTimeout(conn.handshakeTimer);
     conn.ready = true;
     st.backoffMs = BACKOFF_MIN_MS;
-    this.say(`Codex (${st.id}): ligado ao daemon do app-server; os pedidos de aprovação do codex no terminal também podem ser respondidos pelo escritório.`);
+    this.say(tr('Codex ({0}): ligado ao daemon do app-server; os pedidos de aprovação do codex no terminal também podem ser respondidos pelo escritório.', [st.id]));
     this.listLoaded(st, conn);
     this.heartbeat(st, conn);
   }
@@ -384,7 +400,7 @@ export class CodexAppServerService implements ParallelSink {
       () =>
         this.guard(() => {
           if (conn.closed) return;
-          conn.heartbeatTimer = setTimeout(() => this.guard(() => this.drop(st, conn, 'o daemon não responde')), timeoutMs);
+          conn.heartbeatTimer = setTimeout(() => this.guard(() => this.drop(st, conn, tr('o daemon não responde'))), timeoutMs);
           conn.heartbeatTimer.unref?.();
           conn.client.ping().then(
             () =>
@@ -393,7 +409,7 @@ export class CodexAppServerService implements ParallelSink {
                 clearTimeout(conn.heartbeatTimer);
                 this.heartbeat(st, conn);
               }),
-            (err) => this.guard(() => this.drop(st, conn, `o daemon não responde (${errMsg(err)})`)),
+            (err) => this.guard(() => this.drop(st, conn, tr('o daemon não responde ({0})', [errMsg(err)]))),
           );
         }),
       intervalMs,
@@ -403,14 +419,18 @@ export class CodexAppServerService implements ParallelSink {
 
   /**
    * Conexão pronta, a cada tick: arma o prazo das threads assinadas de turno fechado sem prazo (assinadas pela listagem,
-   * sem thread/started), desassina as de turno fechado há UNSUBSCRIBE_AFTER_MS e lista de novo (descoberta que falhou,
-   * novas tentativas vencidas).
+   * sem thread/started), desassina as de turno fechado há UNSUBSCRIBE_AFTER_MS e as de turno aberto sem evento há
+   * STALE_RELEASE_MS, e lista de novo (descoberta que falhou, novas tentativas vencidas).
    */
   private maintain(st: AccountState, conn: Conn, now: number): void {
     const closed = this.closedTurns.get(st.id);
     for (const threadId of [...conn.owned]) {
       if (closed?.get(threadId) === null) closed.set(threadId, now);
       else if (this.idle(st.id, threadId, now)) this.release(conn, threadId);
+      else if (!closed?.has(threadId) && now - (conn.activeAt.get(threadId) ?? now) >= STALE_RELEASE_MS) {
+        this.release(conn, threadId);
+        this.say(tr('Codex ({0}): uma thread assinada ficou {1} min com o turno aberto e sem nenhum evento (o terminal fechou?); o Habblaud a soltou, e os pedidos dela voltam ao hook ({2}).', [st.id, STALE_RELEASE_MS / 60_000, threadId]));
+      }
     }
     if (now < conn.listAt) return;
     if (!conn.discovered || [...conn.retry.values()].some((at) => now >= at)) this.listLoaded(st, conn);
@@ -450,7 +470,7 @@ export class CodexAppServerService implements ParallelSink {
           conn.listAt = this.now() + DISCOVERY_MS;
           if (conn.listWarned) return;
           conn.listWarned = true;
-          this.say(`Codex (${st.id}): o thread/loaded/list falhou (${errMsg(err)}); tento de novo em ${DISCOVERY_MS / 1000} s. Até lá, só as threads que começarem agora entram no canal paralelo.`);
+          this.say(tr('Codex ({0}): o thread/loaded/list falhou ({1}); tento de novo em {2} s. Até lá, só as threads que começarem agora entram no canal paralelo.', [st.id, errMsg(err), DISCOVERY_MS / 1000]));
         }),
     );
   }
@@ -471,14 +491,15 @@ export class CodexAppServerService implements ParallelSink {
     for (const key of conn.open.keys()) this.opts.registry.resolveParallel(key);
     conn.open.clear();
     conn.owned.clear();
+    conn.activeAt.clear();
     conn.client.close();
     conn.proxy.kill();
     if (st.conn !== conn) return;
     st.conn = undefined;
     this.backoff(st);
     if (this.stopped) return;
-    if (wasReady) this.say(`Codex (${st.id}): a conexão com o app-server caiu (${reason}); os pedidos voltam ao hook até reconectar.`);
-    else if (this.states.get(st.id) === st) log.warnOnce(`codex-appserver-refused:${st.id}:${reason}`, `Codex (${st.id}): o app-server não ficou pronto (${reason}); os pedidos seguem com o hook e tento de novo.`);
+    if (wasReady) this.say(tr('Codex ({0}): a conexão com o app-server caiu ({1}); os pedidos voltam ao hook até reconectar.', [st.id, reason]));
+    else if (this.states.get(st.id) === st) log.warnOnce(`codex-appserver-refused:${st.id}:${reason}`, tr('Codex ({0}): o app-server não ficou pronto ({1}); os pedidos seguem com o hook e tento de novo.', [st.id, reason]));
   }
 
   private backoff(st: AccountState): void {
@@ -490,7 +511,7 @@ export class CodexAppServerService implements ParallelSink {
     try {
       fn();
     } catch (err) {
-      log.warnOnce(`codex-appserver:${errMsg(err)}`, `Codex: falha no canal paralelo (${errMsg(err)}).`);
+      log.warnOnce(`codex-appserver:${errMsg(err)}`, tr('Codex: falha no canal paralelo ({0}).', [errMsg(err)]));
     }
   }
 
@@ -509,20 +530,27 @@ export class CodexAppServerService implements ParallelSink {
       this.guard(() => {
         // Fora de `resuming` = a thread fechou (ou a conexão caiu) no meio: o resultado não vale mais.
         if (!conn.resuming.delete(threadId) || conn.closed) return;
-        if (r === 'ok') conn.owned.add(threadId);
+        if (r === 'ok') this.own(conn, threadId);
         else if (r === 'not-daemon') conn.notDaemon.add(threadId);
         else {
           // Erro do daemon (ou sem resposta): a thread não entra no canal até dar certo; uma linha por conta e thread.
-          if (r === 'error') log.warnOnce(`codex-appserver-resume:${st.id}:${threadId}`, `Codex (${st.id}): o thread/resume de uma thread falhou (${threadId}); os pedidos dela seguem com o hook e tento de novo a cada ${DISCOVERY_MS / 1000} s.`);
+          if (r === 'error') log.warnOnce(`codex-appserver-resume:${st.id}:${threadId}`, tr('Codex ({0}): o thread/resume de uma thread falhou ({1}); os pedidos dela seguem com o hook e tento de novo a cada {2} s.', [st.id, threadId, DISCOVERY_MS / 1000]));
           conn.retry.set(threadId, this.now() + (r === 'no-rollout' ? RESUME_RETRY_MS : DISCOVERY_MS));
         }
       }),
     );
   }
 
+  /** A thread passou a ser assinada nesta conexão: o prazo sem eventos começa agora. */
+  private own(conn: Conn, threadId: string): void {
+    if (!conn.owned.has(threadId)) conn.activeAt.set(threadId, this.now());
+    conn.owned.add(threadId);
+  }
+
   /** thread/closed: a assinatura acabou (o cliente já fechou os pedidos abertos dela pelo approvalResolved). */
   private forget(conn: Conn, threadId: string): void {
     conn.owned.delete(threadId);
+    conn.activeAt.delete(threadId);
     conn.resuming.delete(threadId);
     conn.retry.delete(threadId);
     conn.notDaemon.delete(threadId);
@@ -572,14 +600,15 @@ export class CodexAppServerService implements ParallelSink {
   private onApproval(st: AccountState, conn: Conn, req: ApprovalRequest): void {
     if (conn.closed) return;
     // O app-server só manda o pedido a quem assina a thread.
-    conn.owned.add(req.threadId);
+    this.own(conn, req.threadId);
+    conn.activeAt.set(req.threadId, this.now());
     conn.retry.delete(req.threadId);
     // availableDecisions ausente = as quatro; presente sem accept, acceptForSession nem decline (só cancel, ou só emendas
     // de política) = o escritório não tem o que responder (ele nunca manda cancel): nenhum cartão, vale o terminal (a
     // thread segue assinada, então o hook dela sai sem decidir).
     const decisions = req.decisions ?? [...ALL_DECISIONS];
     if (!decisions.some((d) => OFFICE_DECISIONS.has(d))) {
-      this.say(`Codex (${st.id}): pedido de aprovação sem nenhuma decisão que o escritório saiba dar (aprovar, aprovar nesta sessão ou recusar); fica só com o terminal.`);
+      this.say(tr('Codex ({0}): pedido de aprovação sem nenhuma decisão que o escritório saiba dar (aprovar, aprovar nesta sessão ou recusar); fica só com o terminal.', [st.id]));
       return;
     }
     const key = requestKey(st.id, req.requestId);

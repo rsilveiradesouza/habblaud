@@ -29,8 +29,9 @@ import type { Activity, AgentInfo, CodexDecision, PermissionAnswer, PermissionDe
 import { errMsg, log } from '../log';
 import { toolView } from '../sources/terminal';
 import { codexToolView } from './codex';
-import { askCount, askFormat, fitsFormat, isQuestion, parallelChoice, parseHookInput, pickSuggestions, present, rec, unsupportedByCodex, wrongKind, type AskFormat } from './registry-parse';
+import { askCount, askFormat, DEFAULT_TIMEOUT_MS, fitsFormat, isQuestion, parallelChoice, parseHookInput, pickSuggestions, present, rec, unsupportedByCodex, wrongKind, type AskFormat } from './registry-parse';
 import { callSignature, scanToolCall } from './transcript';
+import { tr } from '../../shared/i18n';
 
 export { applyPermission, DEFAULT_TIMEOUT_MS, InvalidRequest, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, parseDecision, pickSuggestions } from './registry-parse';
 
@@ -47,6 +48,12 @@ export const SCAN_EVERY_MS = 1_000;
 /** Principal que esperava (diálogo aberto) e deixou de esperar há este tempo: respondeu no terminal. */
 export const LEFT_WAITING_MS = 3_000;
 export const MAX_PENDING = 32;
+/**
+ * Espera longa (HABBLAUD_PERMISSION_TIMEOUT acima do padrão) sem nenhuma página que responda há este tempo, e sem
+ * celular que possa entrar depois: o pedido volta ao terminal (senão ficaria até 24 h onde ninguém o vê; nos
+ * subagentes em segundo plano o terminal só mostra o diálogo quando o hook termina).
+ */
+export const UNWATCHED_MS = 5 * 60_000;
 
 /** Decisões do app-server que o registro conhece (a lista padrão de um pedido 'parallel'). */
 const CODEX_DECISIONS: readonly CodexDecision[] = ['accept', 'acceptForSession', 'decline', 'cancel'];
@@ -55,10 +62,10 @@ const NO_EXPIRY = Number.MAX_SAFE_INTEGER;
 /** Justificativa do pedido (app-server) no detalhe da atividade. */
 const REASON_MAX = 300;
 const PARALLEL_DONE: Readonly<Record<CodexDecision, string>> = {
-  accept: 'Aprovado no Habblaud',
-  acceptForSession: 'Aprovado no Habblaud (nesta sessão)',
-  decline: 'Recusado no Habblaud',
-  cancel: 'Recusado no Habblaud (e interrompido)',
+  accept: tr('Aprovado no Habblaud'),
+  acceptForSession: tr('Aprovado no Habblaud (nesta sessão)'),
+  decline: tr('Recusado no Habblaud'),
+  cancel: tr('Recusado no Habblaud (e interrompido)'),
 };
 
 /** O que o registro usa do Office (interface mínima: facilita os testes). */
@@ -75,6 +82,8 @@ export interface RegistryOptions {
   office: OfficeLike;
   /** Páginas locais conectadas (Hub.localSize): sem nenhuma, o pedido não é desviado do terminal. */
   viewers: () => number;
+  /** Uma página que ainda não está aberta pode responder depois (celular com login e `permissions` liberado). */
+  answerLater?: () => boolean;
   /** Transcript de um agente presente (ClaudeWatcher.transcriptPathOf). */
   transcriptPathOf?: (agentId: string) => string | undefined;
   /**
@@ -98,7 +107,7 @@ export interface RegistryOptions {
 export type SkipReason = 'no-viewers' | 'unknown-session' | 'unsupported-tool' | 'too-many' | 'parallel';
 export type RegisterResult = { id: string; expiresAt: number } | { skip: SkipReason };
 /** replaced = pedido do hook do Codex trocado pelo pedido 'parallel' da mesma thread (o hook sai sem decidir). */
-export type ReleaseReason = 'terminal' | 'answered' | 'expired' | 'orphan' | 'gone' | 'shutdown' | 'replaced';
+export type ReleaseReason = 'terminal' | 'answered' | 'expired' | 'orphan' | 'gone' | 'unwatched' | 'shutdown' | 'replaced';
 
 /** Pedido de aprovação do canal paralelo do Codex (app-server), para registerParallel. */
 export interface ParallelRequestInput {
@@ -191,6 +200,8 @@ export class PermissionRegistry {
   private sink: ParallelSink | undefined;
   /** ParallelRequestInput.key → id do pedido 'parallel' em aberto. */
   private byKey = new Map<string, string>();
+  /** Desde quando não há nenhuma página que responda (null = há). */
+  private unwatchedSince: number | null = null;
 
   constructor(private readonly opts: RegistryOptions) {
     this.now = opts.now ?? Date.now;
@@ -205,7 +216,7 @@ export class PermissionRegistry {
       try {
         this.tick();
       } catch (err) {
-        log.warnOnce(`permissions-tick:${errMsg(err)}`, `Pedidos de permissão: falha no relógio (${errMsg(err)}).`);
+        log.warnOnce(`permissions-tick:${errMsg(err)}`, tr('Pedidos de permissão: falha no relógio ({0}).', [errMsg(err)]));
       }
     }, this.opts.tickMs ?? 500);
     this.timer.unref?.();
@@ -281,14 +292,14 @@ export class PermissionRegistry {
     if (ask) p.askFormat = askFormat(req.input.questions);
     this.pending.set(id, p);
 
-    const by = target.subagent ? ` (subagente ${target.subagent})` : '';
+    const by = target.subagent ? tr(' (subagente {0})', [target.subagent]) : '';
     const first = info.questions?.[0]?.question;
     if (first) {
       const all = info.questions!.map((q) => q.question).join(' · ');
-      this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '❓', text: truncate(`Pergunta: ${first}`, 46), detail: truncate(all, 300), tool: 'PermissionRequest' }, false);
+      this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '❓', text: truncate(tr('Pergunta: {0}', [first]), 46), detail: truncate(all, 300), tool: 'PermissionRequest' }, false);
       this.opts.office.noticePermission(target.id, `${truncate(first, 120)}${by}`, 'question');
     } else {
-      this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '🔐', text: truncate(`Pede permissão: ${desc.text}`, 46), detail: view.title, tool: 'PermissionRequest' }, false);
+      this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '🔐', text: truncate(tr('Pede permissão: {0}', [desc.text]), 46), detail: view.title, tool: 'PermissionRequest' }, false);
       this.opts.office.noticePermission(target.id, `${desc.text}${by}`);
     }
     this.opts.office.markDirty();
@@ -336,7 +347,7 @@ export class PermissionRegistry {
 
     // Justificativa do app-server: mascarada ANTES de cortar.
     const reason = req.reason?.trim() ? truncate(maskSecrets(req.reason.trim()), REASON_MAX) : '';
-    this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '🔐', text: truncate(`Pede permissão: ${view.text}`, 46), detail: reason ? `${view.title} — ${reason}` : view.title, tool: 'PermissionRequest' }, false);
+    this.opts.office.addActivity(target.id, { id: `${target.id}#perm:${id}`, at: now, kind: 'wait', icon: '🔐', text: truncate(tr('Pede permissão: {0}', [view.text]), 46), detail: reason ? `${view.title} — ${reason}` : view.title, tool: 'PermissionRequest' }, false);
     this.opts.office.noticePermission(target.id, view.text);
     this.opts.office.markDirty();
     return { id };
@@ -438,8 +449,8 @@ export class PermissionRegistry {
     const now = this.now();
     const act: Activity =
       d.behavior === 'allow'
-        ? { id: `${p.agentId}#perm-ok:${id}`, at: now, kind: 'other', icon: '✅', text: d.suggestion !== undefined ? 'Aprovado no Habblaud (sempre permitir)' : 'Aprovado no Habblaud', detail: p.info.title, tool: 'PermissionRequest' }
-        : { id: `${p.agentId}#perm-no:${id}`, at: now, kind: 'wait', icon: '🚫', text: 'Recusado no Habblaud', detail: d.message ? `${p.info.title} — ${d.message}` : p.info.title, tool: 'PermissionRequest' };
+        ? { id: `${p.agentId}#perm-ok:${id}`, at: now, kind: 'other', icon: '✅', text: d.suggestion !== undefined ? tr('Aprovado no Habblaud (sempre permitir)') : tr('Aprovado no Habblaud'), detail: p.info.title, tool: 'PermissionRequest' }
+        : { id: `${p.agentId}#perm-no:${id}`, at: now, kind: 'wait', icon: '🚫', text: tr('Recusado no Habblaud'), detail: d.message ? `${p.info.title} — ${d.message}` : p.info.title, tool: 'PermissionRequest' };
     this.opts.office.addActivity(p.agentId, act, false);
     return 'ok';
   }
@@ -453,7 +464,7 @@ export class PermissionRegistry {
     const answers = checkAnswers(questions, raw);
     if (!answers || answers.some((a) => !fitsFormat(p.askFormat?.[a.question], a))) return 'invalid-answer';
     this.resolve(p, { status: 'decided', behavior: 'answer', answers });
-    const act: Activity = { id: `${p.agentId}#perm-answer:${p.info.id}`, at: this.now(), kind: 'other', icon: '💬', text: 'Respondido no Habblaud', detail: answerSummary(questions, answers), tool: 'PermissionRequest' };
+    const act: Activity = { id: `${p.agentId}#perm-answer:${p.info.id}`, at: this.now(), kind: 'other', icon: '💬', text: tr('Respondido no Habblaud'), detail: answerSummary(questions, answers), tool: 'PermissionRequest' };
     this.opts.office.addActivity(p.agentId, act, false);
     return 'ok';
   }
@@ -461,6 +472,8 @@ export class PermissionRegistry {
   /** Relógio: expiração, órfãos, agente que saiu, resposta no terminal e limpeza das decisões entregues. */
   tick(): void {
     const now = this.now();
+    this.unwatchedSince = this.opts.viewers() > 0 ? null : (this.unwatchedSince ?? now);
+    const unwatched = this.unwatchedSince !== null && now - this.unwatchedSince >= UNWATCHED_MS && !this.opts.answerLater?.();
     for (const [id, p] of this.pending) {
       if (p.outcome) {
         if (now - (p.resolvedAt ?? now) >= this.resolvedKeepMs) this.pending.delete(id);
@@ -476,6 +489,7 @@ export class PermissionRegistry {
       if (now >= p.info.expiresAt + EXPIRY_GRACE_MS) this.release(p, 'expired');
       else if (!p.waiters.size && now - p.idleSince >= this.orphanMs) this.release(p, 'orphan');
       else if (!present(this.opts.office.get(p.agentId))) this.release(p, 'gone');
+      else if (unwatched && p.info.expiresAt - p.info.createdAt > DEFAULT_TIMEOUT_MS) this.release(p, 'unwatched');
       // No Codex o terminal só pede a aprovação depois que o hook termina: não há resposta dada lá para procurar.
       else if (p.codex) continue;
       else if (now - p.lastScanAt >= SCAN_EVERY_MS && this.answeredInTerminal(p, now)) this.release(p, 'answered');
@@ -509,7 +523,7 @@ export class PermissionRegistry {
     par.sent = choice;
     return new Promise<'ok' | 'gone' | 'unavailable'>((done) => done(sink.decide(par.key, choice)))
       .catch((err: unknown): 'unavailable' => {
-        log.warnOnce(`permissions-sink:${errMsg(err)}`, `Pedidos de permissão: o canal paralelo falhou ao repassar a decisão (${errMsg(err)}).`);
+        log.warnOnce(`permissions-sink:${errMsg(err)}`, tr('Pedidos de permissão: o canal paralelo falhou ao repassar a decisão ({0}).', [errMsg(err)]));
         return 'unavailable';
       })
       .then((r): DecideResult => {
@@ -543,7 +557,7 @@ export class PermissionRegistry {
     }
     const main = office.list().find((a) => a.kind === 'main' && a.provider !== 'codex' && a.sessionId === sessionId && a.status !== 'offline');
     if (!main) return undefined;
-    return agentId ? { id: main.id, subagent: agentType ?? 'subagente' } : { id: main.id };
+    return agentId ? { id: main.id, subagent: agentType ?? tr('subagente') } : { id: main.id };
   }
 
   /**
@@ -561,12 +575,18 @@ export class PermissionRegistry {
     if (own) return { id: own.id };
     const main = find(sessionId);
     if (!main) return undefined;
-    return sub ? { id: main.id, subagent: agentType ?? 'subagente' } : { id: main.id };
+    return sub ? { id: main.id, subagent: agentType ?? tr('subagente') } : { id: main.id };
   }
 
   private queueOf(p: Pending): { queued?: number } {
+    // Pela ordem de chegada (a do Map), não pelo createdAt: dois pedidos no mesmo milissegundo empatariam e cada
+    // um contaria o outro como "atrás dele".
     let n = 0;
-    for (const o of this.pending.values()) if (o !== p && !o.outcome && o.agentId === p.agentId && o.info.createdAt >= p.info.createdAt) n++;
+    let after = false;
+    for (const o of this.pending.values()) {
+      if (o === p) after = true;
+      else if (after && !o.outcome && o.agentId === p.agentId) n++;
+    }
     return n ? { queued: n } : {};
   }
 

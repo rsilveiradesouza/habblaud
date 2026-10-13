@@ -3,11 +3,12 @@
 // processo nem confere o daemon (isso é do serviço): só WebSocket (`GET /rpc`, espera o 101) + JSON-RPC,
 // initialize/initialized, descoberta e inscrição de threads e os pedidos de aprovação de comando e de arquivo.
 //
-// Só `item/commandExecution/requestApproval` e `item/fileChange/requestApproval` viram evento, e só eles podem
-// ser respondidos. Qualquer outro pedido do servidor (perguntas, permissões, ferramentas dinâmicas, renovação
-// de token, atestado, elicitação MCP, aprovações v1) NUNCA recebe resposta: a primeira resposta vence, e uma
-// resposta do Habblaud quebraria a sessão do TUI.
+// Só `item/commandExecution/requestApproval` (de um comando: nem rede nem writeStdin) e
+// `item/fileChange/requestApproval` viram evento, e só eles podem ser respondidos. Qualquer outro pedido do servidor
+// (perguntas, permissões, ferramentas dinâmicas, renovação de token, atestado, elicitação MCP, aprovações v1) NUNCA
+// recebe resposta: a primeira resposta vence, e uma resposta do Habblaud quebraria a sessão do TUI.
 import { EventEmitter } from 'node:events';
+import { tr } from '../../../../shared/i18n';
 import type { CodexDecision } from '../../../../shared/types';
 import { RpcError, RpcPeer } from './rpc';
 import { WsConnection } from './ws';
@@ -101,6 +102,15 @@ export function patchFromChanges(changes: unknown): string {
   return lines.length ? ['*** Begin Patch', ...lines, '*** End Patch'].join('\n') : '';
 }
 
+/**
+ * Pedido de comando que o cartão mostra como é: `kind` "command" (ausente vale "command", nos servidores antigos) e sem
+ * `networkApprovalContext`. Um pedido de rede (o cartão mostraria um comando, ou nada, e "aprovar nesta sessão"
+ * liberaria o host) e um `writeStdin` (o cartão não mostraria o que vai ser digitado) ficam só com o terminal.
+ */
+function isPlainCommand(p: Rec): boolean {
+  return (p.kind === undefined || p.kind === null || p.kind === 'command') && (p.networkApprovalContext === undefined || p.networkApprovalContext === null);
+}
+
 function decisionsOf(raw: unknown): CodexDecision[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return raw.filter((d): d is CodexDecision => typeof d === 'string' && DECISIONS.has(d));
@@ -117,7 +127,8 @@ const patchKey = (threadId: string, itemId: string): string => `${threadId}\n${i
 
 /**
  * Uma conexão com o app-server de uma conta. Eventos: 'approval' (ApprovalRequest), 'approvalResolved'
- * ({ requestId }), 'threadStarted' (threadId), 'threadClosed' (threadId) e 'close' (motivo), uma vez só.
+ * ({ requestId }), 'threadStarted' (threadId), 'threadClosed' (threadId), 'threadActivity' (threadId: qualquer
+ * notificação ou pedido do servidor com o threadId, menos o thread/closed) e 'close' (motivo), uma vez só.
  */
 export class CodexAppServerClient extends EventEmitter {
   private ws?: WsConnection;
@@ -205,7 +216,7 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   close(): void {
-    this.finish('fechada pelo Habblaud');
+    this.finish(tr('fechada pelo Habblaud'));
   }
 
   private async open(): Promise<void> {
@@ -220,7 +231,7 @@ export class CodexAppServerClient extends EventEmitter {
       try {
         rpc.handle(text);
       } catch (err) {
-        this.finish(`falha ao tratar mensagem do app-server (${errMessage(err)})`);
+        this.finish(tr('falha ao tratar mensagem do app-server ({0})', [errMessage(err)]));
       }
     });
     ws.on('close', (reason: string) => this.finish(reason));
@@ -234,7 +245,7 @@ export class CodexAppServerClient extends EventEmitter {
         capabilities: { optOutNotificationMethods: [...OPT_OUT_NOTIFICATIONS] },
       });
     } catch (err) {
-      this.finish(`initialize recusado (${errMessage(err)})`);
+      this.finish(tr('initialize recusado ({0})', [errMessage(err)]));
     }
     if (this.closedReason !== undefined) throw new Error(this.closedReason);
     rpc.notify('initialized');
@@ -242,13 +253,15 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
-    if (!this.rpc || !this.ready || this.closedReason !== undefined) return Promise.reject(new Error('sem conexão com o app-server'));
+    if (!this.rpc || !this.ready || this.closedReason !== undefined) return Promise.reject(new Error(tr('sem conexão com o app-server')));
     return this.rpc.request(method, params);
   }
 
   private onNotification(method: string, params: unknown): void {
     const p = rec(params);
     if (!p) return;
+    const active = str(p.threadId);
+    if (active && method !== 'thread/closed') this.emit('threadActivity', active);
     switch (method) {
       case 'thread/started': {
         const thread = rec(p.thread);
@@ -292,12 +305,14 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   private onServerRequest(id: number | string, method: string, params: unknown): void {
-    // Só aprovação de comando e de arquivo; o resto fica sem resposta (vale o terminal).
-    if (method !== COMMAND_APPROVAL && method !== FILE_APPROVAL) return;
     const p = rec(params);
     const threadId = str(p?.threadId);
+    if (threadId) this.emit('threadActivity', threadId);
+    // Só aprovação de comando e de arquivo; o resto fica sem resposta (vale o terminal).
+    if (method !== COMMAND_APPROVAL && method !== FILE_APPROVAL) return;
     // O mesmo id de novo é o replay do resume: um pedido só.
     if (!p || !threadId || this.approvals.has(id) || this.released.has(threadId)) return;
+    if (method === COMMAND_APPROVAL && !isPlainCommand(p)) return;
     this.approvals.set(id, { threadId, answered: false });
     const req: ApprovalRequest = { requestId: id, threadId, kind: method === COMMAND_APPROVAL ? 'command' : 'fileChange' };
     if (req.kind === 'command') {
@@ -310,7 +325,7 @@ export class CodexAppServerClient extends EventEmitter {
       if (patch) req.patch = patch;
     }
     const grant = req.kind === 'fileChange' ? str(p.grantRoot) : undefined;
-    const reason = str(p.reason) ?? (grant ? `pede para escrever em ${grant}` : undefined);
+    const reason = str(p.reason) ?? (grant ? tr('pede para escrever em {0}', [grant]) : undefined);
     if (reason) req.reason = reason;
     const decisions = decisionsOf(p.availableDecisions);
     if (decisions) req.decisions = decisions;
